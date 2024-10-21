@@ -99,37 +99,41 @@ def get_relevent_keypoint_frames(playback: PyK4APlayback, keypoints: list):
     times = []
     start_timing = False
     frame_counter = 0
-    while True:
-        try:
-            capture = playback.get_next_capture()
+    try:
+        playback.open()
+        while True:
+            try:
+                capture = playback.get_next_capture()
 
-            if capture.color is not None and capture.depth is not None:
+                if capture.color is not None and capture.depth is not None:
 
-                capture._color = cv2.cvtColor(cv2.imdecode(
-                    capture.color, cv2.IMREAD_COLOR), cv2.COLOR_BGR2BGRA)
-                capture._color_format = ImageFormat.COLOR_BGRA32
-                if not start_timing:
-                    start_timing = True
-                    start_time = capture._color_timestamp_usec
-                    elapsed = 0.0
-                else:
-                    elapsed = round(
-                        (capture._color_timestamp_usec - start_time)/1000000, 2)
+                    capture._color = cv2.cvtColor(cv2.imdecode(
+                        capture.color, cv2.IMREAD_COLOR), cv2.COLOR_BGR2BGRA)
+                    capture._color_format = ImageFormat.COLOR_BGRA32
+                    if not start_timing:
+                        start_timing = True
+                        start_time = capture._color_timestamp_usec
+                        elapsed = 0.0
+                    else:
+                        elapsed = round(
+                            (capture._color_timestamp_usec - start_time)/1000000, 2)
 
-                closest_keypoint = is_closest_to_keypoints(
-                    keypoints, keypoint_dict, elapsed)
+                    closest_keypoint = is_closest_to_keypoints(
+                        keypoints, keypoint_dict, elapsed)
 
-                if closest_keypoint is not None:
-                    keypoint_dict[closest_keypoint] = frame_counter
+                    if closest_keypoint is not None:
+                        keypoint_dict[closest_keypoint] = frame_counter
 
-                times.append(elapsed)
-                img = capture.color
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-                frame_cache.append(img)
-                frame_counter += 1
+                    times.append(elapsed)
+                    img = capture.color
+                    img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                    frame_cache.append(img)
+                    frame_counter += 1
 
-        except EOFError:
-            break
+            except EOFError:
+                break
+    finally:
+        playback.close()
     return keypoint_dict, frame_cache, times
 
 
@@ -259,7 +263,7 @@ def record_pointed_spots(playback: PyK4APlayback, short_file: str, keypoints: li
     out.release()
 
 
-def create_sphere_at_coordinate(center, radius, color=[1, 0, 0]):
+def create_sphere_at_coordinate(center, radius, color=[1, 0, 0], scaling_factor=1.0):
     """
     Create a sphere at a specific coordinate.
 
@@ -268,9 +272,10 @@ def create_sphere_at_coordinate(center, radius, color=[1, 0, 0]):
     :param color: RGB color of the sphere (default is red)
     :return: Open3D sphere geometry
     """
-    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+    sphere = o3d.geometry.TriangleMesh.create_sphere(
+        radius=radius*scaling_factor)
     sphere.paint_uniform_color(color)
-    sphere.translate(center)
+    sphere.translate(np.array(center)*scaling_factor)
     return sphere
 
 
