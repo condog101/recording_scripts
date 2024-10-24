@@ -65,3 +65,15 @@ def get_color_name(rgb_tuple):
     except ValueError:
         # If exact match not found, find the closest color
         return closest_color(rgb_tuple)
+
+
+def get_scene_geometry_from_capture(capture):
+    capture._color = cv2.cvtColor(cv2.imdecode(
+        capture.color, cv2.IMREAD_COLOR), cv2.COLOR_BGR2BGRA)
+    capture._color_format = ImageFormat.COLOR_BGRA32
+    points = capture.transformed_depth_point_cloud.reshape(
+        (-1, 3)).astype('float64')
+    colors = capture.color[..., (2, 1, 0)].reshape(
+        (-1, 3))
+
+    return colors, points

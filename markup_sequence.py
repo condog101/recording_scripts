@@ -7,7 +7,7 @@ import open3d as o3d
 
 import pickle
 
-from utils import create_bounding_box, is_closest_to_keypoints, get_scene_image_from_capture, info, get_color_name
+from utils import create_bounding_box, is_closest_to_keypoints, get_scene_image_from_capture, info, get_color_name, get_scene_geometry_from_capture
 
 COLORS = [(r, g, b) for r in [0, 255] for g in [0, 255] for b in [0, 255]]
 
@@ -265,65 +265,6 @@ def record_pointed_spots(playback: PyK4APlayback, short_file: str, keypoints: li
 
     print('assign bounding box')
 
-    bbox_coords = get_bounding_box_top_left_top_right(written_frames[0])
-
-    with open(f"bbox_coords_{short_file}.npy", 'wb+') as f:
-        # source, destination
-        np.save(f, bbox_coords)
-
-
-def get_bounding_box_top_left_top_right(opencv_image_drawn):
-
-    cv2.namedWindow('image')
-    cv2.setMouseCallback('image', extract_coordinates)
-
-    # Bounding box reference points
-    image_coordinates = []
-    show = True
-
-    def extract_coordinates(self, event, x, y, flags, parameters):
-
-        nonlocal show
-        nonlocal image_coordinates
-        # Record starting (x,y) coordinates on left mouse button click
-        if event == cv2.EVENT_LBUTTONDOWN:
-            image_coordinates = [(x, y)]
-
-        # Record ending (x,y) coordintes on left mouse button release
-        elif event == cv2.EVENT_LBUTTONUP:
-            image_coordinates.append((x, y))
-            print('top left: {}, bottom right: {}'.format(
-                self.image_coordinates[0], self.image_coordinates[1]))
-            print('x,y,w,h : ({}, {}, {}, {})'.format(image_coordinates[0][0], image_coordinates[0][1], self.image_coordinates[
-                  1][0] - image_coordinates[0][0], image_coordinates[1][1] - image_coordinates[0][1]))
-
-            show = False
-    while True:
-        cv2.imshow('Image', opencv_image_drawn)
-
-        # Wait for 1ms and check for click or key press
-        key = cv2.waitKey(1) & 0xFF
-        if not show or key == ord('q'):
-            break
-
-    return np.array(image_coordinates)
-
-
-def create_sphere_at_coordinate(center, radius, color=[1, 0, 0], scaling_factor=1.0):
-    """
-    Create a sphere at a specific coordinate.
-
-    :param center: List or numpy array of [x, y, z] coordinates
-    :param radius: Radius of the sphere
-    :param color: RGB color of the sphere (default is red)
-    :return: Open3D sphere geometry
-    """
-    sphere = o3d.geometry.TriangleMesh.create_sphere(
-        radius=radius*scaling_factor)
-    sphere.paint_uniform_color(color)
-    sphere.translate(np.array(center)*scaling_factor)
-    return sphere
-
 
 def raw_get_3d_coordinates(coordinates_2d: tuple, depth_map: np.array, calibration):
     """
@@ -349,19 +290,13 @@ def get_3d_coordinates(coordinates_2d, depth_map, calibration):
     return points
 
 
-def update_sphere_position(sphere, new_center):
-    translation = np.array(new_center) - np.array(sphere.get_center())
-    sphere.translate(translation)
-    return np.array(new_center)
+def pick_mesh_points(mesh, img=None):
 
+    # cv2.imshow('refwindow', img)
+    # cv2.waitKey(0)
 
-def pick_mesh_points(mesh, img):
-
-    cv2.imshow('refwindow', img)
-    cv2.waitKey(0)
-
-    # closing all open windows
-    cv2.destroyAllWindows()
+    # # closing all open windows
+    # cv2.destroyAllWindows()
 
     vis = o3d.visualization.VisualizerWithVertexSelection()
     vis.create_window()
@@ -375,6 +310,66 @@ def pick_mesh_points(mesh, img):
     return vis.get_picked_points()
 
 
+def pick_points(pcd):
+    print("")
+    print(
+        "1) Please pick at least three correspondences using [shift + left click]"
+    )
+    print("   Press [shift + right click] to undo point picking")
+    print("2) Afther picking points, press q for close the window")
+    vis = o3d.visualization.VisualizerWithEditing()
+    vis.create_window()
+    vis.add_geometry(pcd)
+    vis.run()  # user picks points
+    vis.destroy_window()
+    print("")
+    return vis.get_picked_points()
+
+
+def play_single_initial_frame_mark_both(spine_mesh, playback, offset, baseline_frame, scale_scene=1.0):
+    try:
+        frame_index = 0
+        playback.open()
+
+        info(playback)
+        if offset != 0.0:
+            playback.seek(int(offset * 1000000))
+        picked_points = []
+        geom = None
+        while True:
+            try:
+                capture = playback.get_next_capture()
+                if capture.color is not None and capture.depth is not None and geom is None:
+
+                    if frame_index == baseline_frame:
+
+                        colors, points = get_scene_geometry_from_capture(
+                            capture)
+                        geometry = o3d.geometry.PointCloud()
+                        geometry.points = o3d.utility.Vector3dVector(
+                            points * scale_scene)
+                    geometry.colors = o3d.utility.Vector3dVector(
+                        (colors/255).astype('float64'))
+
+                    picked_scene_points = pick_points(geometry)
+                    scene_picked_points = (
+                        points * scale_scene)[picked_scene_points]
+
+                    picked_points_coords = pick_mesh_points(spine_mesh)
+                    picked_points = [x.coord for x in picked_points_coords]
+
+                    break
+                    frame_index += 1
+
+            except EOFError:
+                break
+
+    finally:
+        playback.close()
+        return np.array([picked_points, scene_picked_points])
+
+
+# this might not be needed
 def play_single_initial_frame(spine_mesh, playback, offset, baseline_frame, coordinate_list):
     try:
         frame_index = 0
@@ -384,6 +379,7 @@ def play_single_initial_frame(spine_mesh, playback, offset, baseline_frame, coor
         if offset != 0.0:
             playback.seek(int(offset * 1000000))
         picked_points = []
+
         while True:
             try:
                 capture = playback.get_next_capture()

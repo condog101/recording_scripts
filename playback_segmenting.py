@@ -7,8 +7,8 @@ import open3d as o3d
 import pickle
 from typing import Optional
 from utils import process_time_string, info
-from markup_sequence import record_pointed_spots, create_sphere_at_coordinate, get_3d_coordinates, pick_mesh_points, raw_get_3d_coordinates, play_single_initial_frame
-from registration import rough_register_via_correspondences
+from markup_sequence import record_pointed_spots, get_3d_coordinates, raw_get_3d_coordinates, play_single_initial_frame_mark_both
+from registration import rough_register_via_correspondences, prepare_dataset, execute_global_registration, source_icp_transform
 
 
 def get_scene_geometry_from_capture(capture):
@@ -30,24 +30,59 @@ def get_3d_coords_from_stored_2d(coordinate_list, frame_index, capture):
     return frame_3d_coordinates
 
 
-def create_and_update_vis_with_spheres(frame_3d_coordinates, vis):
-    spheres = [create_sphere_at_coordinate(
-        x[0], 3, color=np.array(x[3])/255) for x in frame_3d_coordinates]
+def identify_bounding_box_coordinates(coordinates):
+    x_c, y_c, w_c, h_c, _ = coordinates[0]
+    shift_xc = x_c + (w_c//2)
+    shift_yc = y_c + (h_c//2)
+    max_x_offset = -1.0
+    max_y_offset = -1.0
+    for coordinate in coordinates[1:]:
+        x, y, w, h, _ = coordinate
+        shift_x = x + (w//2)
+        shift_y = y + (h//2)
 
-    for ind in range(len(spheres)):
-        vis.add_geometry(spheres[ind])
+        offset_x = abs(shift_x - shift_xc)
+        offset_y = abs(shift_y - shift_yc)
 
-    return spheres
+        max_x_offset = max(max_x_offset, offset_x)
+        max_y_offset = max(max_y_offset, offset_y)
+    return ((shift_xc - max_x_offset, shift_yc - max_y_offset), 2*max_x_offset, 2*max_y_offset)
 
 
-def subsample_mesh(colors, points, bbox_coords, calibration, depth_map):
-    bbox_3d = [raw_get_3d_coordinates(
-        coord, depth_map, calibration) for coord in bbox_coords]
+def get_min_max_x_y(coords_3d):
+    min_x = 100000000
+    min_y = 100000000
+    max_x = -100000000
+    max_y = -100000000
+    for coord in coords_3d:
+        x, y, _ = coord
+        min_x = min(x, min_x)
+        min_y = min(y, min_y)
+        max_x = max(x, max_x)
+        max_y = max(y, max_y)
+    return (min_x, min_y, max_x, max_y)
 
-    min_x = bbox_coords[0][0]
-    min_y = bbox_coords[0][1]
-    max_x = bbox_coords[1][0]
-    max_y = bbox_coords[1][1]
+
+def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset=30.0):
+    min_x = bbox_params[0][0]
+    min_y = bbox_params[0][1]
+    max_x = min_x + bbox_params[1]
+    max_y = min_y + bbox_params[2]
+    # define coords in clockwise order tl, tr, br, bl
+    point_coords = [(min_x, min_y), (max_x, min_y),
+                    (max_x, max_y), (min_x, max_y)]
+    coords_3d = [raw_get_3d_coordinates(x, depth_map, calibration)
+                 for x in point_coords]
+    filter_coords = get_min_max_x_y(coords_3d)
+    mask_x = (points[:, 0] > (filter_coords[0] - offset)
+              ) & (points[:, 0] < (filter_coords[2] + offset))
+
+    mask_y = (points[:, 1] > (filter_coords[1] - offset)
+              ) & (points[:, 1] < (filter_coords[3] + offset))
+
+    combined_mask = mask_x & mask_y
+
+    return colors[combined_mask], points[combined_mask]
 
 
 def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short: str, keypoints: list, mesh_filepath: Optional[str] = None,
@@ -55,14 +90,9 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
 
     if record_spots:
         record_pointed_spots(playback, file_short, keypoints)
-    bbox_file = f"bbox_coords_{file_short}.npy"
 
     coordinates_file = f"stored_coordinates_{file_short}.pkl"
     time_file = f"times_{file_short}.pkl"
-
-    with open(bbox_file, 'rb') as f:
-        # source, destination
-        bbox_coords = np.load(f)
 
     with open(coordinates_file, 'rb') as f:
         coordinates = pickle.load(f)
@@ -72,11 +102,13 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
 
     coordinate_list = list(zip(*coordinates.values()))
 
+    flat_bounding_box = identify_bounding_box_coordinates(coordinate_list[0])
+
     spine_mesh = o3d.io.read_triangle_mesh(mesh_filepath)
     if spine_mesh is not None and record_mesh_points:
-        picked_points = play_single_initial_frame(
-            spine_mesh, playback, offset, baseline_frame, coordinate_list)
-        pp_list = np.array([x.coord for x in picked_points])
+        pp_list = play_single_initial_frame_mark_both(
+            spine_mesh, playback, offset, baseline_frame)
+
         print(pp_list)
         with open(f"meshpoints_{file_short}.npy", 'wb+') as f:
             # source, destination
@@ -86,8 +118,8 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
             # source, destination
             pp_list = np.load(f)
 
-    vis = o3d.visualization.Visualizer()
-    vis.create_window()
+    # pplist, for array is source, second is target
+
     geometry = o3d.geometry.PointCloud()
 
     frame_index = 0
@@ -96,9 +128,29 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
 
     pcd_spine = o3d.geometry.PointCloud()
     pcd_spine.points = spine_mesh.vertices
+    pcd_spine.normals = spine_mesh.vertex_normals
 
     source_whole_rough = o3d.geometry.PointCloud()
-    source_whole_rough.points = o3d.utility.Vector3dVector(pp_list)
+    source_whole_rough.points = o3d.utility.Vector3dVector(pp_list[0])
+    source_whole_rough.colors = o3d.utility.Vector3dVector(
+        np.array([[0, 1, 0] for _ in pp_list[1]]))
+
+    source_scene_rough = o3d.geometry.PointCloud()
+    source_scene_rough.points = o3d.utility.Vector3dVector(
+        pp_list[1] * scale_scene)
+    source_scene_rough.colors = o3d.utility.Vector3dVector(
+        np.array([[1, 0, 0] for _ in pp_list[1]]))
+
+    rough_transform = rough_register_via_correspondences(
+        source_whole_rough, source_scene_rough)
+
+    # do registration for 1st
+
+    visualize = True
+
+    if visualize:
+        vis = o3d.visualization.Visualizer()
+        vis.create_window()
 
     try:
         playback.open()
@@ -113,35 +165,49 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
 
                     colors, points = get_scene_geometry_from_capture(capture)
                     subsample_colors, subsample_points = subsample_mesh(
-                        colors, points, bbox_coords, capture._calibration, capture.transformed_depth)
+                        colors, points, flat_bounding_box, capture._calibration, capture.transformed_depth)
+
                     geometry.points = o3d.utility.Vector3dVector(
-                        points * scale_scene)
+                        subsample_points * scale_scene)
                     geometry.colors = o3d.utility.Vector3dVector(
-                        (colors/255).astype('float64'))
+                        (subsample_colors/255).astype('float64'))
 
                     frame_3d_coordinates = get_3d_coords_from_stored_2d(
                         coordinate_list, frame_index, capture)
-                    rough_transform = rough_register_via_correspondences(source_whole_rough, [
-                        np.array(x[0]) * scale_scene for x in frame_3d_coordinates])
 
-                    inv_rough_transform = np.linalg.inv(rough_transform)
-                    spine_mesh.transform(rough_transform)
-                    if first:
+                    icp_transform = source_icp_transform(
+                        pcd_spine, geometry, rough_transform, threshold=5)
 
-                        vis.add_geometry(geometry)
-                        vis.add_geometry(spine_mesh)
-                        first = False
+                    if frame_index % 100 == 0:
+                        print(icp_transform)
+                    inv_fine_transform = np.linalg.inv(icp_transform)
+
+                    spine_mesh.transform(icp_transform)
+                    if visualize:
+                        if first:
+
+                            vis.add_geometry(geometry)
+                            vis.add_geometry(spine_mesh)
+                            first = False
+                        else:
+                            vis.update_geometry(geometry)
+                            vis.update_geometry(spine_mesh)
+
+                        vis.poll_events()
+                        vis.update_renderer()
+                        frame_index += 1
                     else:
-                        vis.update_geometry(geometry)
-                        vis.update_geometry(spine_mesh)
-
-                    vis.poll_events()
-                    vis.update_renderer()
-                    frame_index += 1
-                    spine_mesh.transform(inv_rough_transform)
+                        o3d.visualization.draw_geometries(
+                            [geometry, spine_mesh])
+                        # o3d.visualization.draw_geometries(
+                        #     [source_whole_rough, source_scene_rough])
+                    # spine_mesh.transform(inv_fine_transform)
+                    spine_mesh.transform(inv_fine_transform)
 
             except EOFError:
                 break
+            except ValueError:
+                continue
     finally:
         playback.close()
 
@@ -162,11 +228,7 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
 # spinous process of L4 (minute 0:48)
 # spinous process of L3 (in correspondance to the navigation system, minute 0:49)
 # spinous process of L5 (minute 0:51)
-# PL4, try PL3, SL4, SL3, SL5
-
-
-def add_mesh_to_scene(mesh_file_path, playback, initial_frame):
-    mesh = o3d.io.read_triangle_mesh(mesh_file_path)
+# try PL4(L), PL4(R), PL4(R), SL4, SL3, SL5
 
 
 def main() -> None:
@@ -200,9 +262,6 @@ def main() -> None:
     baseline_frame = args.init_frame
 
     keypoints = process_time_string(args.keypoints)
-
-    if mesh_file_path is not None:
-        print("Adding mesh to frame {init_frame}")
 
     playback = PyK4APlayback(filename)
 
