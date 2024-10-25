@@ -3,14 +3,10 @@ import cv2
 import webcolors
 
 
-def create_bounding_box(center_x, center_y, box_size=10):
-    half_size = box_size // 2
+def create_bounding_box(top_left_x, top_left_y, width, height):
 
-    top_left_x = center_x - half_size
-    top_left_y = center_y - half_size
-
-    bottom_right_x = center_x + half_size
-    bottom_right_y = center_y + half_size
+    bottom_right_x = top_left_x + width
+    bottom_right_y = top_left_y + height
 
     return (top_left_x, top_left_y, bottom_right_x, bottom_right_y)
 

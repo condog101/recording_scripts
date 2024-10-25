@@ -9,6 +9,7 @@ import pickle
 
 from utils import create_bounding_box, is_closest_to_keypoints, get_scene_image_from_capture, info, get_color_name, get_scene_geometry_from_capture
 
+
 COLORS = [(r, g, b) for r in [0, 255] for g in [0, 255] for b in [0, 255]]
 
 
@@ -22,64 +23,60 @@ def tracker_continue(tracker, new_frame, color, circle_size=5):
     return new_frame
 
 
-def track_on_list(init_frame, init_coord_x, init_coord_y, box_size, remaining_frames, color, circle_size=5):
+def track_on_list(init_frame, init_coord_x, init_coord_y, width, height, remaining_frames, color, circle_size=5):
     tracker = cv2.TrackerCSRT_create()
-    # tracker = cv2.legacy.TrackerMedianFlow_create()
+
     init_frame_copy = init_frame.copy()
+    # TODO change from same box size
     tracker.init(init_frame_copy, (init_coord_x,
-                 init_coord_y, box_size, box_size))
+                 init_coord_y, width, height))
     marked_frames = []
     for frame_ind, frame in enumerate(remaining_frames):
         new_frame = frame
         (success, box) = tracker.update(new_frame)
         if success:
             (x, y, w, h) = [int(v) for v in box]
-            # cv2.circle(new_frame, (x + (w//2), y + (h//2)), circle_size//2,
-            #            color, 2)
+
         else:
             x = init_coord_x
             y = init_coord_y
-            w = box_size
-            h = box_size
+            w = width
+            h = height
             tracker.init(remaining_frames[frame_ind-15], (init_coord_x,
-                                                          init_coord_y, box_size, box_size))
-            # cv2.circle(new_frame, (init_coord_x + (box_size//2), init_coord_y + (box_size//2)), circle_size//2,
-            #            color, 2)
+                                                          init_coord_y, width, height))
 
         marked_frames.append((x, y, w, h, color))
-    # cv2.circle(init_frame_copy, (init_coord_x + (box_size//2), init_coord_y + (box_size//2)), circle_size//2,
-    #            color, 2)
 
-    return [(init_coord_x, init_coord_y, box_size, box_size, color)] + marked_frames
+    return [(init_coord_x, init_coord_y, width, height, color)] + marked_frames
 
 
-def write_bounding_boxes(store_frames: list, coordinates: dict, box_size=15, circle_size=5):
+def write_bounding_boxes(store_frames: list, coordinates: list, frame_no: int):
 
-    marked_coordinates = {}
-    for ind, coordinates in coordinates.items():
-        x_c, y_c, color = coordinates
+    marked_coordinates = []
 
-        frame_no = ind
+    x_tl, y_tl, color = coordinates[0]
+    x_br, y_br, _ = coordinates[1]
+    w = x_br - x_tl
+    h = y_br - y_tl
 
-        landmark_frame = store_frames[frame_no]
-        subsequent_frames = store_frames[frame_no+1:]
-        prev_frames = store_frames[:frame_no]
-        x_c, y_c, _, _ = create_bounding_box(
-            x_c-(box_size//2), y_c-(box_size//2), box_size=box_size)
-        marked_sub_frames = track_on_list(
-            landmark_frame, x_c, y_c, box_size, subsequent_frames, color)[1:]
+    landmark_frame = store_frames[frame_no]
+    subsequent_frames = store_frames[frame_no+1:]
+    prev_frames = store_frames[:frame_no]
 
-        marked_prev_frames = track_on_list(
-            landmark_frame, x_c, y_c, box_size, prev_frames[::-1], color)[::-1]
+    marked_sub_frames = track_on_list(
+        landmark_frame, x_tl, y_tl, w, h, subsequent_frames, color)[1:]
 
-        marked_coordinates[frame_no] = marked_prev_frames + marked_sub_frames
+    marked_prev_frames = track_on_list(
+        landmark_frame, x_tl, y_tl, w, h, prev_frames[::-1], color)[::-1]
+
+    marked_coordinates = marked_prev_frames + marked_sub_frames
     frame_markings = []
     for ind, frame in enumerate(store_frames):
 
-        for key, coordinate_set in marked_coordinates.items():
-            x, y, w, h, color = coordinate_set[ind]
-            cv2.circle(frame, (x + (w//2), y + (h//2)), circle_size//2,
-                       color, 2)
+        for coordinate in marked_coordinates:
+            x, y, w, h, color = coordinate
+            cv2.rectangle(frame, (x, y), (x+w, y+h),
+                          color, 2)
         frame_markings.append(frame)
 
     return frame_markings, marked_coordinates
@@ -93,8 +90,7 @@ def play_written_frames(frames):
         key = cv2.waitKey(int(1000 / 30))
 
 
-def get_relevent_keypoint_frames(playback: PyK4APlayback, keypoints: list):
-    keypoint_dict = {}
+def get_relevent_keypoint_frames(playback: PyK4APlayback):
     frame_cache = []
     times = []
     start_timing = False
@@ -118,12 +114,6 @@ def get_relevent_keypoint_frames(playback: PyK4APlayback, keypoints: list):
                         elapsed = round(
                             (capture._color_timestamp_usec - start_time)/1000000, 2)
 
-                    closest_keypoint = is_closest_to_keypoints(
-                        keypoints, keypoint_dict, elapsed)
-
-                    if closest_keypoint is not None:
-                        keypoint_dict[closest_keypoint] = frame_counter
-
                     times.append(elapsed)
                     img = capture.color
                     img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
@@ -134,12 +124,12 @@ def get_relevent_keypoint_frames(playback: PyK4APlayback, keypoints: list):
                 break
     finally:
         playback.close()
-    return keypoint_dict, frame_cache, times
+    return frame_cache, times
 
 
-def mark_relevant_frames(keypoint_dict, frame_cache, times):
+def mark_relevant_frames(frame_cache, baseline_frame=0):
 
-    coordinates = {}
+    coordinates = []
     current_keypoint = None
     current_i = None
 
@@ -156,42 +146,39 @@ def mark_relevant_frames(keypoint_dict, frame_cache, times):
 
         if event == cv2.EVENT_LBUTTONDOWN:
             print(f"Mouse clicked at coordinates: ({x}, {y})")
-            color = COLORS[current_i]
-            coordinates[current_keypoint] = (x, y, color)
-            show = False
+            color = COLORS[0]
+            coordinates.append((x, y, color))
 
     cv2.namedWindow('Image')
     cv2.setMouseCallback('Image', internal_marker_callback)
 
-    for i, (sec, index) in enumerate(keypoint_dict.items()):
-        current_i = i
+    for index, rel_frame in enumerate(frame_cache):
 
-        current_keypoint = index
-        window_name = f"image_{sec}"
-        time_frame = times[index]
-        print(time_frame)
+        if index == baseline_frame:
 
-        while True:
-            rel_frame = frame_cache[current_keypoint]
-            cv2.imshow('Image', rel_frame)
+            current_keypoint = index
 
-            # Wait for 1ms and check for click or key press
-            key = cv2.waitKey(1) & 0xFF
+            while True:
+                cv2.imshow('Image', rel_frame)
 
-            if not show or key == ord('q'):
-                break
-            elif key == 81 or key == 2424832:  # Left arrow key
-                current_keypoint -= 5
-                # Add your left arrow key action here
-            elif key == 83 or key == 2555904:  # Right arrow key
-                current_keypoint += 5
+                # Wait for 1ms and check for click or key press
+                key = cv2.waitKey(1) & 0xFF
 
-        show = True
+                if not show or key == ord('q'):
+                    break
+                elif key == 81 or key == 2424832:  # Left arrow key
+                    current_keypoint -= 5
+                    # Add your left arrow key action here
+                elif key == 83 or key == 2555904:  # Right arrow key
+                    current_keypoint += 5
+
+            show = True
+            break
     cv2.destroyAllWindows()
-    return coordinates
+    return coordinates, baseline_frame
 
 
-def record_pointed_spots(playback: PyK4APlayback, short_file: str, keypoints: list):
+def record_pointed_spots(playback: PyK4APlayback, short_file: str):
 
     paused = False
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -202,13 +189,14 @@ def record_pointed_spots(playback: PyK4APlayback, short_file: str, keypoints: li
     lineType = 2
 
     # this function gets keypoints with second: frame index, frame list, times for each frame
-    keypoint_dict, frame_cache, times = get_relevent_keypoint_frames(
-        playback, keypoints)
+    frame_cache, times = get_relevent_keypoint_frames(
+        playback)
 
-    coordinates = mark_relevant_frames(keypoint_dict, frame_cache, times)
+    coordinates, baseline_frame = mark_relevant_frames(
+        frame_cache)
 
     written_frames, marked_coordinates = write_bounding_boxes(
-        frame_cache, coordinates)
+        frame_cache, coordinates, baseline_frame)
 
     cv2.namedWindow('Image')
 

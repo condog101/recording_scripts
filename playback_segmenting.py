@@ -6,9 +6,9 @@ import open3d as o3d
 
 import pickle
 from typing import Optional
-from utils import process_time_string, info
+from utils import info
 from markup_sequence import record_pointed_spots, get_3d_coordinates, raw_get_3d_coordinates, play_single_initial_frame_mark_both
-from registration import rough_register_via_correspondences, prepare_dataset, execute_global_registration, source_icp_transform
+from registration import rough_register_via_correspondences, source_icp_transform
 
 
 def get_scene_geometry_from_capture(capture):
@@ -30,25 +30,6 @@ def get_3d_coords_from_stored_2d(coordinate_list, frame_index, capture):
     return frame_3d_coordinates
 
 
-def identify_bounding_box_coordinates(coordinates):
-    x_c, y_c, w_c, h_c, _ = coordinates[0]
-    shift_xc = x_c + (w_c//2)
-    shift_yc = y_c + (h_c//2)
-    max_x_offset = -1.0
-    max_y_offset = -1.0
-    for coordinate in coordinates[1:]:
-        x, y, w, h, _ = coordinate
-        shift_x = x + (w//2)
-        shift_y = y + (h//2)
-
-        offset_x = abs(shift_x - shift_xc)
-        offset_y = abs(shift_y - shift_yc)
-
-        max_x_offset = max(max_x_offset, offset_x)
-        max_y_offset = max(max_y_offset, offset_y)
-    return ((shift_xc - max_x_offset, shift_yc - max_y_offset), 2*max_x_offset, 2*max_y_offset)
-
-
 def get_min_max_x_y(coords_3d):
     min_x = 100000000
     min_y = 100000000
@@ -63,7 +44,7 @@ def get_min_max_x_y(coords_3d):
     return (min_x, min_y, max_x, max_y)
 
 
-def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset=30.0):
+def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset=10.0):
     min_x = bbox_params[0][0]
     min_y = bbox_params[0][1]
     max_x = min_x + bbox_params[1]
@@ -85,11 +66,11 @@ def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset=3
     return colors[combined_mask], points[combined_mask]
 
 
-def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short: str, keypoints: list, mesh_filepath: Optional[str] = None,
+def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short: str, mesh_filepath: Optional[str] = None,
          baseline_frame: int = 0, record_mesh_points: bool = False, scale_scene=10.0):
 
     if record_spots:
-        record_pointed_spots(playback, file_short, keypoints)
+        record_pointed_spots(playback, file_short)
 
     coordinates_file = f"stored_coordinates_{file_short}.pkl"
     time_file = f"times_{file_short}.pkl"
@@ -99,10 +80,6 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
 
     with open(time_file, 'rb') as f:
         times = pickle.load(f)
-
-    coordinate_list = list(zip(*coordinates.values()))
-
-    flat_bounding_box = identify_bounding_box_coordinates(coordinate_list[0])
 
     spine_mesh = o3d.io.read_triangle_mesh(mesh_filepath)
     if spine_mesh is not None and record_mesh_points:
@@ -162,24 +139,19 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
             try:
                 capture = playback.get_next_capture()
                 if capture.color is not None and capture.depth is not None:
-
+                    x_c, y_c, w_c, h_c, _ = coordinates[frame_index]
                     colors, points = get_scene_geometry_from_capture(capture)
                     subsample_colors, subsample_points = subsample_mesh(
-                        colors, points, flat_bounding_box, capture._calibration, capture.transformed_depth)
+                        colors, points, ((x_c, y_c), w_c, h_c), capture._calibration, capture.transformed_depth, offset=20.0)
 
                     geometry.points = o3d.utility.Vector3dVector(
                         subsample_points * scale_scene)
                     geometry.colors = o3d.utility.Vector3dVector(
                         (subsample_colors/255).astype('float64'))
 
-                    frame_3d_coordinates = get_3d_coords_from_stored_2d(
-                        coordinate_list, frame_index, capture)
-
                     icp_transform = source_icp_transform(
-                        pcd_spine, geometry, rough_transform, threshold=5)
+                        pcd_spine, geometry, rough_transform, threshold=10)
 
-                    if frame_index % 100 == 0:
-                        print(icp_transform)
                     inv_fine_transform = np.linalg.inv(icp_transform)
 
                     spine_mesh.transform(icp_transform)
@@ -239,8 +211,6 @@ def main() -> None:
     parser.add_argument('--record-spots', action='store_true', default=False)
     parser.add_argument(
         "FILE", type=str, help="Path to MKV file written by k4arecorder")
-    parser.add_argument(
-        "--keypoints", type=str, help="keyframes (seconds)", default="")
 
     parser.add_argument(
         "--mesh-file", type=str, help="Path to ply file with ground truth"
@@ -261,12 +231,10 @@ def main() -> None:
     mesh_file_path = "/home/connorscomputer/Documents/CT_DATA/CT_NIFTIS/NIFTI_SOLIDS/smoothed_o3d_mask_color.ply"
     baseline_frame = args.init_frame
 
-    keypoints = process_time_string(args.keypoints)
-
     playback = PyK4APlayback(filename)
 
     file_short = filename.split('/')[-1].split('.')[0]
-    play(playback, offset, record_spots, file_short, keypoints,
+    play(playback, offset, record_spots, file_short,
          mesh_filepath=mesh_file_path, baseline_frame=baseline_frame, record_mesh_points=record_mesh_points)
 
 
