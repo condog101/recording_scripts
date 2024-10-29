@@ -8,7 +8,8 @@ from typing import Optional
 from utils import info
 from markup_sequence import record_pointed_spots, get_3d_coordinates, raw_get_3d_coordinates, play_single_initial_frame_mark_both
 from registration import rough_register_via_correspondences, source_icp_transform
-from armature_utils import get_joint_positions
+from armature_utils import get_joint_positions, get_vector_joint_mappings
+from joints import create_armature_objects
 import bezier
 from collections import defaultdict
 
@@ -78,68 +79,6 @@ def partition(mesh):
     return color_map
 
 
-class BallJoint:
-    def __init__(self, position):
-        self.position = np.array(position)
-        # Initialize quaternion to identity rotation [1,0,0,0]
-        self.quaternion = np.array([1.0, 0.0, 0.0, 0.0])
-
-    def set_rotation_axis_angle(self, axis, angle):
-        """Set joint rotation using axis-angle representation"""
-        axis = axis / np.linalg.norm(axis)  # normalize axis
-        half_angle = angle / 2.0
-        self.quaternion[0] = np.cos(half_angle)
-        self.quaternion[1:] = axis * np.sin(half_angle)
-
-    def quaternion_multiply(self, q1, q2):
-        """Multiply two quaternions"""
-        w1, x1, y1, z1 = q1
-        w2, x2, y2, z2 = q2
-        return np.array([
-            w1*w2 - x1*x2 - y1*y2 - z1*z2,
-            w1*x2 + x1*w2 + y1*z2 - z1*y2,
-            w1*y2 - x1*z2 + y1*w2 + z1*x2,
-            w1*z2 + x1*y2 - y1*x2 + z1*w2
-        ])
-
-    def rotate_point(self, point):
-        """Apply rotation to a point using quaternion rotation"""
-        # Convert point to quaternion form (w=0)
-        p_quat = np.array([0.0, *point])
-
-        # Get quaternion conjugate
-        q_conj = np.array([self.quaternion[0], *(-self.quaternion[1:])])
-
-        # Rotate point: q * p * q'
-        rotated = self.quaternion_multiply(
-            self.quaternion,
-            self.quaternion_multiply(p_quat, q_conj)
-        )
-
-        # Return rotated point (ignore w component)
-        return rotated[1:]
-
-    def transform_point(self, point):
-        """Apply full transformation (rotation + translation) to point"""
-        # First rotate
-        rotated_point = self.rotate_point(point)
-        # Then translate
-        return rotated_point + self.position
-
-    def to_matrix(self):
-        """Convert to 4x4 transformation matrix"""
-        w, x, y, z = self.quaternion
-
-        matrix = np.array([
-            [1-2*y*y-2*z*z,  2*x*y-2*w*z,    2*x*z+2*w*y,    self.position[0]],
-            [2*x*y+2*w*z,    1-2*x*x-2*z*z,  2*y*z-2*w*x,    self.position[1]],
-            [2*x*z-2*w*y,    2*y*z+2*w*x,    1-2*x*x-2*y*y,  self.position[2]],
-            [0,              0,              0,              1]
-        ])
-
-        return matrix
-
-
 def extract_control_points(spine_points: np.array, control_points: int):
 
     remaining_points = spine_points[1:-1]
@@ -200,10 +139,22 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
     # number of bezier control points = number of joints + 2
 
     partition_map = partition(spine_mesh)
-
-    links = get_joint_positions(partition_map, spine_mesh)
+    rgb_num_map = {key: ind for ind, key in enumerate(partition_map)}
+    # replace keys in partition maps with
+    for key, value in rgb_num_map.items():
+        partition_map[value] = partition_map.pop(key)
+    links = get_joint_positions(partition_map, spine_mesh, rgb_num_map)
+    root_node = create_armature_objects(links)
+    root_node.set_parents()
+    # got to here on 28th Oct
+    # for each joint, get the vector going from the joint, into the vertebrae
+    # general purpose, how to adjust - propogate from the middle outwards, so one should be route, then traverse to child
+    # downwards, this means the vertebrae should be a class, with parent linking to children through joints
     print(f"{links - 1} joints fitted")
+
+    # not sure about the next 2 lines
     joint_positions = [x[1] for x in links[:-1]]
+    vectors_for_joints = get_vector_joint_mappings(links)
     num_joints = len(partition_map) - 1
 
     if len(spine_points_spline) != surg_points_spline:
