@@ -8,10 +8,12 @@ from typing import Optional
 from utils import info
 from markup_sequence import record_pointed_spots, get_3d_coordinates, raw_get_3d_coordinates, play_single_initial_frame_mark_both
 from registration import rough_register_via_correspondences, source_icp_transform
-from armature_utils import get_joint_positions, get_vector_joint_mappings
-from joints import create_armature_objects
-import bezier
+from armature_utils import get_joint_positions
+from joints import create_armature_objects, Spine
+from scipy.interpolate import Rbf
 from collections import defaultdict
+import copy
+from catmull_rom import fit_catmull_rom
 
 
 def get_scene_geometry_from_capture(capture):
@@ -79,12 +81,28 @@ def partition(mesh):
     return color_map
 
 
-def extract_control_points(spine_points: np.array, control_points: int):
+def get_closest_spine_indices(spine_vertex_points, spine_mesh):
+    spine_vertices = np.asarray(spine_mesh.vertices)
+    matching_indices = []
+    print("getting closest points")
+    for point in spine_vertex_points:
+        norms = np.linalg.norm(spine_vertices - point, axis=1)
+        print(np.min(norms))
+        matching_indices.append(
+            np.argmin(norms))
+    return np.array(matching_indices)
 
-    remaining_points = spine_points[1:-1]
-    indices = np.linspace(0, len(remaining_points)-1,
-                          control_points-2, dtype=int)
-    return spine_points[[0, *indices, -1]]
+
+def get_rough_transform(source_points, scene_points, scale_scene):
+    source_whole_rough = o3d.geometry.PointCloud()
+    source_whole_rough.points = o3d.utility.Vector3dVector(source_points)
+
+    source_scene_rough = o3d.geometry.PointCloud()
+    source_scene_rough.points = o3d.utility.Vector3dVector(
+        scene_points * scale_scene)
+
+    return rough_register_via_correspondences(
+        source_whole_rough, source_scene_rough)
 
 
 def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short: str, mesh_filepath: Optional[str] = None,
@@ -143,42 +161,48 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
     # replace keys in partition maps with
     for key, value in rgb_num_map.items():
         partition_map[value] = partition_map.pop(key)
-    links = get_joint_positions(partition_map, spine_mesh, rgb_num_map)
-    root_node = create_armature_objects(links)
-    root_node.set_parents()
-    # got to here on 28th Oct
-    # for each joint, get the vector going from the joint, into the vertebrae
-    # general purpose, how to adjust - propogate from the middle outwards, so one should be route, then traverse to child
-    # downwards, this means the vertebrae should be a class, with parent linking to children through joints
-    print(f"{links - 1} joints fitted")
 
-    # not sure about the next 2 lines
-    joint_positions = [x[1] for x in links[:-1]]
-    vectors_for_joints = get_vector_joint_mappings(links)
-    num_joints = len(partition_map) - 1
+    source_points = pp_list[0]
+    scene_points = pp_list[1]
+    rough_transform = get_rough_transform(
+        source_points, scene_points, scale_scene)
 
-    if len(spine_points_spline) != surg_points_spline:
-        raise ValueError(
-            "Curve points on ref frame and mesh are different lengths")
+    # these need to be transformed too!
+    # links = get_joint_positions(partition_map, spine_mesh)
+    # root_node = create_armature_objects(links, partition_map)
+    # root_node.set_parents()
 
-    control_point_count = num_joints + 2
+    # source_points = pp_list[0]
+    # scene_points = pp_list[1]
+    # rough_transform = get_rough_transform(
+    #     source_points, scene_points, scale_scene)
 
-    select_spine_points_spline = extract_control_points(
-        spine_points_spline, control_point_count)
-    select_surg_points_spline = extract_control_points(
-        surg_points_spline, control_point_count)
+    spine_spline_indices = get_closest_spine_indices(
+        spine_points_spline, spine_mesh)
 
-    split_spine_points_spline = select_spine_points_spline.T
-    split_surg_points_spline = select_surg_points_spline.T
+    # curve_surg = Rbf(surg_points_spline[0], surg_points_spline[1],
+    #                  surg_points_spline[2], function='thin_plate', smooth=5, episilon=5)
 
-    curve_spine = bezier.Curve(
-        split_spine_points_spline, degree=control_point_count-1)
-    curve_surg = bezier.Curve(split_surg_points_spline,
-                              degree=control_point_count-1)
+    # curve_surg_bounds = ((np.min(surg_points_spline[0]), np.max(surg_points_spline[0])),
+    #                      ((np.min(surg_points_spline[1]), np.max(
+    #                          surg_points_spline[1]))))
 
-    # fit bezier curve to both spine process approximations
-    # get link between joints of vertebrae, and control points of vertebrae
-    # find parameter of joints to minimize difference between joints of
+    # spine_obj = Spine(root_node, np.array(
+    #     spine_mesh.vertices), spine_spline_indices, curve_surg, curve_surg_bounds, initial_transform=rough_transform)
+
+    # fparams, _ = spine_obj.run_optimization()
+
+    # new_root_node = create_armature_objects(links, partition_map)
+    # new_root_node.set_parents()
+    # spine_obj_original = Spine(new_root_node, np.array(
+    #     spine_mesh.vertices), spine_spline_indices, curve_surg, curve_surg_bounds)
+    # spine_obj_original.apply_joint_parameters(fparams)
+    # spine_obj_original.apply_joint_angles()
+
+    # new_mesh = copy.deepcopy(spine_mesh)
+    # new_mesh.vertices = o3d.utility.Vector3dVector(spine_obj_original.vertices)
+
+    # o3d.visualization.draw_geometries([spine_mesh, new_mesh])
 
     geometry = o3d.geometry.PointCloud()
 
@@ -186,23 +210,10 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
 
     first = True
 
+    # pcd for mesh from CT - this is correct scale, camera needs scaling
     pcd_spine = o3d.geometry.PointCloud()
     pcd_spine.points = spine_mesh.vertices
     pcd_spine.normals = spine_mesh.vertex_normals
-
-    source_whole_rough = o3d.geometry.PointCloud()
-    source_whole_rough.points = o3d.utility.Vector3dVector(pp_list[0])
-    source_whole_rough.colors = o3d.utility.Vector3dVector(
-        np.array([[0, 1, 0] for _ in pp_list[1]]))
-
-    source_scene_rough = o3d.geometry.PointCloud()
-    source_scene_rough.points = o3d.utility.Vector3dVector(
-        pp_list[1] * scale_scene)
-    source_scene_rough.colors = o3d.utility.Vector3dVector(
-        np.array([[1, 0, 0] for _ in pp_list[1]]))
-
-    rough_transform = rough_register_via_correspondences(
-        source_whole_rough, source_scene_rough)
 
     # do registration for 1st
 
@@ -235,9 +246,41 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
                     icp_transform = source_icp_transform(
                         pcd_spine, geometry, rough_transform, threshold=10)
 
+                    spine_mesh.transform(icp_transform)
+
+                    # everything below is the deformation stuff
+
+                    # links = get_joint_positions(partition_map, spine_mesh)
+                    # root_node = create_armature_objects(links, partition_map)
+                    # root_node.set_parents()
+
+                    # # instead, we want catmull rom splines
+
+                    # curve_surg_points = fit_catmull_rom(surg_points_spline)
+
+                    # spine_obj = Spine(root_node, np.array(
+                    #     spine_mesh.vertices), spine_spline_indices, curve_surg_points, initial_transform=None)
+
+                    # fparams, _ = spine_obj.run_optimization()
+
+                    # new_root_node = create_armature_objects(
+                    #     links, partition_map)
+                    # new_root_node.set_parents()
+                    # spine_obj_original = Spine(new_root_node, np.array(
+                    #     spine_mesh.vertices), spine_spline_indices, curve_surg_points)
+                    # spine_obj_original.apply_joint_parameters(fparams)
+                    # spine_obj_original.apply_joint_angles()
+
+                    # new_mesh = copy.deepcopy(spine_mesh)
+                    # new_mesh.vertices = o3d.utility.Vector3dVector(
+                    #     spine_obj_original.vertices)
+
+                    # o3d.visualization.draw_geometries([spine_mesh, new_mesh])
+
+                    # everything abouve is deformation stuff
+
                     inv_fine_transform = np.linalg.inv(icp_transform)
 
-                    spine_mesh.transform(icp_transform)
                     if visualize:
                         if first:
 

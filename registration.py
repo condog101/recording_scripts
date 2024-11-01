@@ -8,7 +8,7 @@ def rough_register_via_correspondences(source_cloud, target):
 
     p2p = o3d.pipelines.registration.TransformationEstimationPointToPoint()
     corr = np.array([[i, len(target.points) - 1 - i]
-                    for i in range(len(target.points))])
+                    for i in range(len(target.points))]).astype(np.float64)
     trans_init = p2p.compute_transformation(
         source_cloud, target, o3d.utility.Vector2iVector(corr))
 

@@ -1,6 +1,9 @@
 from pyk4a import ImageFormat, PyK4APlayback
 import cv2
 import webcolors
+import numpy as np
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
 
 
 def create_bounding_box(top_left_x, top_left_y, width, height):
@@ -73,3 +76,24 @@ def get_scene_geometry_from_capture(capture):
         (-1, 3))
 
     return colors, points
+
+
+def vector_to_translation_matrix(translation):
+    """Convert a 3D translation vector to a 4x4 homogeneous matrix"""
+    matrix = np.eye(4)  # Create 4x4 identity matrix
+    matrix[:3, 3] = translation  # Set translation components
+    return matrix
+
+
+def emd(X, Y):
+    d = cdist(X, Y)
+    assignment = linear_sum_assignment(d)
+    return d[assignment].sum() / min(len(X), len(Y))
+
+
+def normalize_list_of_quaternion_params(quatlist):
+    new_params = quatlist.copy()
+    for i in range(0, len(quatlist), 4):
+        new_params[i:i+4] = quatlist[i:i+4] / \
+            np.linalg.norm(quatlist[i:i+4])
+    return new_params

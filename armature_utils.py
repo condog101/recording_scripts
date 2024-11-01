@@ -37,13 +37,13 @@ def get_linkage_ordering(centroid_dict):
     return node_order
 
 
-def get_joint_positions(partition_map, mesh, rgb_num_map):
+def get_joint_positions(partition_map, mesh):
     # this gets a link
     vertices = np.asarray(mesh.vertices)
     centroid_dict = {}
     for key, value in partition_map.items():
         rel_vertices = vertices[value]
-        centroid_dict[rgb_num_map[key]] = np.mean(rel_vertices, axis=0)
+        centroid_dict[key] = np.mean(rel_vertices, axis=0)
 
     link_order = get_linkage_ordering(centroid_dict)
     bone_coords = []
@@ -70,22 +70,3 @@ def get_joint_positions(partition_map, mesh, rgb_num_map):
     # each vertebrae has a bone
 
     return bone_coords
-
-
-def get_vector_joint_mappings(tail_heads):
-    vectors = []
-    for i in range(len(tail_heads), step=2):
-        # first tail, and last head is a centroid, no need to half
-        # for vectors branching of joint, at head of i[1]
-        joint_pos = tail_heads[i][1]
-        prev_pos_vec = (tail_heads[i][0] - joint_pos)
-
-        if i != 0:
-            prev_pos_vec *= 0.5
-
-        next_post = (tail_heads[i+1][1] - tail_heads[i+1][0])
-        if i != len(tail_heads) - 2:
-            next_post *= 0.5
-
-        vectors.append((prev_pos_vec, next_post))
-    return vectors
