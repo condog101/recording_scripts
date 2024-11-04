@@ -4,7 +4,7 @@ from scipy.interpolate import Rbf
 from scipy.spatial.distance import directed_hausdorff
 from scipy.optimize import minimize
 from catmull_rom import fit_catmull_rom
-from utils import emd
+from utils import emd, remove_distant_points, align_centroids
 
 
 class BallJoint:
@@ -246,7 +246,7 @@ class Vertebrae:
 
 class Spine:
 
-    def __init__(self, root_vertebrae, vertices_array, control_point_inds, video_curve_points, initial_transform=None, grid_sample_points=500):
+    def __init__(self, root_vertebrae, vertices_array, control_point_inds, video_curve_points, alpha=0.5, initial_transform=None):
         self.root_vertebrae = root_vertebrae
 
         if initial_transform is not None:
@@ -266,6 +266,7 @@ class Spine:
 
         self.quaternion_bounds = [(-1.0, 1.0)
                                   for _ in range(0, len(self.all_joints) * 4)]
+        self.alpha = alpha
 
     def reset_spine(self):
         self.vertices[:, :] = self.initial_vertices[:, :]
@@ -276,25 +277,28 @@ class Spine:
 
     def get_current_curve_points(self):
         rel_points = self.vertices[self.control_point_inds]
-        return fit_catmull_rom(rel_points)
+        cleaned_points = remove_distant_points(rel_points)
+        return fit_catmull_rom(cleaned_points, alpha=self.alpha)
 
     def get_curve_similarity(self):
         current_curve_points = self.get_current_curve_points()
+        aligned_curve = align_centroids(
+            self.video_curve_points, current_curve_points)
 
-        # import open3d as o3d
-        # pcd1 = o3d.geometry.PointCloud()
-        # pcd1.points = o3d.utility.Vector3dVector(current_curve_points)
-        # pcd2 = o3d.geometry.PointCloud()
-        # pcd2.points = o3d.utility.Vector3dVector(self.video_points)
-        # pcd1.colors = o3d.utility.Vector3dVector(
-        #     np.array([[1, 0, 0] for _ in current_curve_points]))
-        # pcd2.colors = o3d.utility.Vector3dVector(
-        #     np.array([[0, 1, 0] for _ in self.video_points]))
-        # o3d.visualization.draw_geometries([pcd1, pcd2])
+# import open3d as o3d
+# pcd1 = o3d.geometry.PointCloud()
+# pcd1.points = o3d.utility.Vector3dVector(current_curve_points)
+# pcd2 = o3d.geometry.PointCloud()
+# pcd2.points = o3d.utility.Vector3dVector(self.video_curve_points)
+# pcd1.colors = o3d.utility.Vector3dVector(
+#     np.array([[1, 0, 0] for _ in current_curve_points]))
+# pcd2.colors = o3d.utility.Vector3dVector(
+#     np.array([[0, 1, 0] for _ in self.video_curve_points]))
+# o3d.visualization.draw_geometries([pcd1, pcd2])
 
-        # return max(directed_hausdorff(self.video_curve_points, current_curve_points)[0],
-        #            directed_hausdorff(current_curve_points, self.video_curve_points)[0])
-        return emd(self.video_curve_points, current_curve_points)
+        # return max(directed_hausdorff(self.video_curve_points, aligned_curve)[0],
+        #            directed_hausdorff(aligned_curve, self.video_curve_points)[0])
+        return emd(self.video_curve_points, aligned_curve)
 
     def apply_joint_parameters(self, joint_parameters):
         # joint parameters is np.array of shape NumJointsx4

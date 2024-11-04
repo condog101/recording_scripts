@@ -5,12 +5,11 @@ from pyk4a import PyK4APlayback, ImageFormat
 import open3d as o3d
 import pickle
 from typing import Optional
-from utils import info
+from utils import info, remove_distant_points
 from markup_sequence import record_pointed_spots, get_3d_coordinates, raw_get_3d_coordinates, play_single_initial_frame_mark_both
 from registration import rough_register_via_correspondences, source_icp_transform
 from armature_utils import get_joint_positions
 from joints import create_armature_objects, Spine
-from scipy.interpolate import Rbf
 from collections import defaultdict
 import copy
 from catmull_rom import fit_catmull_rom
@@ -105,6 +104,15 @@ def get_rough_transform(source_points, scene_points, scale_scene):
         source_whole_rough, source_scene_rough)
 
 
+# 1/11/2024 - need to re-record points to check correspondence issue
+
+def clean_mesh(spine_mesh, partition):
+
+    for key, vert_list in partition.items():
+        o3d.visualization.draw_geometries(
+            [spine_mesh.select_by_index(vert_list)])
+
+
 def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short: str, mesh_filepath: Optional[str] = None,
          baseline_frame: int = 0, record_mesh_points: bool = False, scale_scene=10.0, record_spline_points=False):
 
@@ -121,88 +129,68 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
         times = pickle.load(f)
 
     spine_mesh = o3d.io.read_triangle_mesh(mesh_filepath)
-    if spine_mesh is not None:
-        if record_mesh_points:
-            pp_list = play_single_initial_frame_mark_both(
-                spine_mesh, playback, offset, baseline_frame)
 
-            print(pp_list)
-            with open(f"meshpoints_{file_short}.npy", 'wb+') as f:
-                # source, destination
-                np.save(f, pp_list)
-        else:
-            with open(f"meshpoints_{file_short}.npy", 'rb') as f:
-                # source, destination
-                pp_list = np.load(f)
+    if record_mesh_points:
+        if spine_mesh is None:
+            raise ValueError(
+                f"Spine mesh filepath is wrong, cannot set points")
+        pp_list = play_single_initial_frame_mark_both(
+            spine_mesh, playback, offset, baseline_frame)
 
-        if record_spline_points:
-            spline_list = play_single_initial_frame_mark_both(
-                spine_mesh, playback, offset, baseline_frame)
+        print(pp_list)
+        with open(f"meshpoints_{file_short}.npy", 'wb+') as f:
+            # source, destination
+            np.save(f, np.array(pp_list))
+    else:
+        with open(f"meshpoints_{file_short}.npy", 'rb') as f:
+            # source, destination
+            pp_list = np.load(f)
 
-            print(spline_list)
-            with open(f"spline_points_{file_short}.npy", 'wb+') as f:
-                # source, destination
-                np.save(f, spline_list)
-        else:
-            with open(f"spline_points_{file_short}.npy", 'rb') as f:
-                # source, destination
-                spline_list = np.load(f)
+    if record_spline_points:
+        if spine_mesh is None:
+            raise ValueError(
+                f"Spine mesh filepath is wrong, cannot set points")
+        spline_list = play_single_initial_frame_mark_both(
+            spine_mesh, playback, offset, baseline_frame)
+
+        print(spline_list)
+        with open(f"spline_points_{file_short}.pkl", 'wb+') as f:
+            # source, destination
+            pickle.dump(spline_list, f)
+    else:
+        with open(f"spline_points_{file_short}.pkl", 'rb') as f:
+            # source, destination
+            spline_list = pickle.load(f)
 
     # pplist, for array is source, second is target
 
     spine_points_spline = spline_list[0]
     surg_points_spline = spline_list[1]
 
+    curve_surg_points = fit_catmull_rom(surg_points_spline)
+    # I think the ordering of this is wrong
+    curve_spine_points = fit_catmull_rom(
+        remove_distant_points(spine_points_spline))
+
     # number of joints is number of vertebrae -1
     # number of bezier control points = number of joints + 2
 
     partition_map = partition(spine_mesh)
+
     rgb_num_map = {key: ind for ind, key in enumerate(partition_map)}
     # replace keys in partition maps with
     for key, value in rgb_num_map.items():
         partition_map[value] = partition_map.pop(key)
+
+    # clean_mesh(spine_mesh, partition_map)
 
     source_points = pp_list[0]
     scene_points = pp_list[1]
     rough_transform = get_rough_transform(
         source_points, scene_points, scale_scene)
 
-    # these need to be transformed too!
-    # links = get_joint_positions(partition_map, spine_mesh)
-    # root_node = create_armature_objects(links, partition_map)
-    # root_node.set_parents()
-
-    # source_points = pp_list[0]
-    # scene_points = pp_list[1]
-    # rough_transform = get_rough_transform(
-    #     source_points, scene_points, scale_scene)
-
     spine_spline_indices = get_closest_spine_indices(
         spine_points_spline, spine_mesh)
-
-    # curve_surg = Rbf(surg_points_spline[0], surg_points_spline[1],
-    #                  surg_points_spline[2], function='thin_plate', smooth=5, episilon=5)
-
-    # curve_surg_bounds = ((np.min(surg_points_spline[0]), np.max(surg_points_spline[0])),
-    #                      ((np.min(surg_points_spline[1]), np.max(
-    #                          surg_points_spline[1]))))
-
-    # spine_obj = Spine(root_node, np.array(
-    #     spine_mesh.vertices), spine_spline_indices, curve_surg, curve_surg_bounds, initial_transform=rough_transform)
-
-    # fparams, _ = spine_obj.run_optimization()
-
-    # new_root_node = create_armature_objects(links, partition_map)
-    # new_root_node.set_parents()
-    # spine_obj_original = Spine(new_root_node, np.array(
-    #     spine_mesh.vertices), spine_spline_indices, curve_surg, curve_surg_bounds)
-    # spine_obj_original.apply_joint_parameters(fparams)
-    # spine_obj_original.apply_joint_angles()
-
-    # new_mesh = copy.deepcopy(spine_mesh)
-    # new_mesh.vertices = o3d.utility.Vector3dVector(spine_obj_original.vertices)
-
-    # o3d.visualization.draw_geometries([spine_mesh, new_mesh])
 
     geometry = o3d.geometry.PointCloud()
 
@@ -217,7 +205,7 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
 
     # do registration for 1st
 
-    visualize = True
+    visualize = False
 
     if visualize:
         vis = o3d.visualization.Visualizer()
@@ -250,32 +238,43 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
 
                     # everything below is the deformation stuff
 
-                    # links = get_joint_positions(partition_map, spine_mesh)
-                    # root_node = create_armature_objects(links, partition_map)
-                    # root_node.set_parents()
+                    links = get_joint_positions(partition_map, spine_mesh)
+                    root_node = create_armature_objects(links, partition_map)
+                    root_node.set_parents()
 
-                    # # instead, we want catmull rom splines
+                    # instead, we want catmull rom splines
 
-                    # curve_surg_points = fit_catmull_rom(surg_points_spline)
+                    spine_obj = Spine(root_node, np.array(
+                        spine_mesh.vertices), spine_spline_indices, curve_surg_points, alpha=1.0,
+                        initial_transform=None)
 
-                    # spine_obj = Spine(root_node, np.array(
-                    #     spine_mesh.vertices), spine_spline_indices, curve_surg_points, initial_transform=None)
+                    fparams, _ = spine_obj.run_optimization()
 
-                    # fparams, _ = spine_obj.run_optimization()
+                    new_root_node = create_armature_objects(
+                        links, partition_map)
+                    new_root_node.set_parents()
+                    spine_obj_original = Spine(new_root_node, np.array(
+                        spine_mesh.vertices), spine_spline_indices, curve_surg_points, alpha=1.0)
+                    spine_obj_original.apply_joint_parameters(fparams)
+                    spine_obj_original.apply_joint_angles()
 
-                    # new_root_node = create_armature_objects(
-                    #     links, partition_map)
-                    # new_root_node.set_parents()
-                    # spine_obj_original = Spine(new_root_node, np.array(
-                    #     spine_mesh.vertices), spine_spline_indices, curve_surg_points)
-                    # spine_obj_original.apply_joint_parameters(fparams)
-                    # spine_obj_original.apply_joint_angles()
+                    new_mesh = copy.deepcopy(spine_mesh)
+                    new_mesh.vertices = o3d.utility.Vector3dVector(
+                        spine_obj_original.vertices)
 
-                    # new_mesh = copy.deepcopy(spine_mesh)
-                    # new_mesh.vertices = o3d.utility.Vector3dVector(
-                    #     spine_obj_original.vertices)
+                    new_mesh.compute_vertex_normals()  # Recompute vertex normals
+                    new_mesh.compute_triangle_normals()
 
-                    # o3d.visualization.draw_geometries([spine_mesh, new_mesh])
+                    joint_spheres = []
+                    for joint in spine_obj_original.all_joints:
+                        position = joint.position
+                        sphere = o3d.geometry.TriangleMesh.create_sphere(
+                            radius=50.0)
+                        sphere.translate(position)
+                        joint_spheres.append(sphere)
+                    o3d.visualization.draw_geometries(
+                        [*joint_spheres, new_mesh])
+                    o3d.visualization.draw_geometries([spine_mesh, new_mesh])
 
                     # everything abouve is deformation stuff
 

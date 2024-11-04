@@ -91,9 +91,94 @@ def emd(X, Y):
     return d[assignment].sum() / min(len(X), len(Y))
 
 
+def clamp_quaternion(quat):
+    """
+    Clamp quaternion to represent at most 90 degrees rotation in any axis.
+
+    Args:
+        quat: numpy array [w, x, y, z] where w is the scalar component
+
+    Returns:
+        clamped quaternion
+    """
+    # Ensure w is positive (this makes the angle interpretation simpler)
+    if quat[0] < 0:
+        quat = -quat
+
+    # For 90 degrees, w component should be cos(45°) = 1/√2 ≈ 0.7071
+    # Because quaternion elements represent half angles
+    min_w = np.sqrt(2) / 2
+
+    if quat[0] < min_w:
+        # Quaternion represents rotation > 90 degrees
+        # Scale vector part to maintain direction but reduce magnitude
+        vec_part = quat[1:]
+        vec_magnitude = np.linalg.norm(vec_part)
+        if vec_magnitude > 0:
+            # Calculate new vector magnitude for 90 degree rotation
+            new_vec_magnitude = np.sqrt(1 - min_w**2)
+            vec_part = (vec_part / vec_magnitude) * new_vec_magnitude
+            quat = np.array([min_w, vec_part[0], vec_part[1], vec_part[2]])
+
+    return quat
+
+
 def normalize_list_of_quaternion_params(quatlist):
     new_params = quatlist.copy()
     for i in range(0, len(quatlist), 4):
-        new_params[i:i+4] = quatlist[i:i+4] / \
-            np.linalg.norm(quatlist[i:i+4])
+        new_params[i:i+4] = clamp_quaternion(quatlist[i:i+4] /
+                                             np.linalg.norm(quatlist[i:i+4]))
     return new_params
+
+
+def remove_distant_points(points, threshold_factor=2.0):
+    """
+    Remove points that are unusually far from their nearest neighbors.
+
+    Args:
+        points: numpy array of shape (n, 3) containing 3D coordinates
+        threshold_factor: points with min distance > threshold_factor * mean_min_distance
+                        will be considered outliers
+
+    Returns:
+        numpy array with outliers removed
+    """
+    # Calculate pairwise distances between all points
+    distances = np.sqrt(((points[:, np.newaxis] - points) ** 2).sum(axis=2))
+
+    # Set diagonal to infinity so we don't count distance to self
+    np.fill_diagonal(distances, np.inf)
+
+    # Find minimum distance for each point to any other point
+    min_distances = np.min(distances, axis=1)
+
+    # Calculate threshold based on mean of minimum distances
+    threshold = np.mean(min_distances) * threshold_factor
+
+    # Keep points whose minimum distance is below threshold
+    mask = min_distances < threshold
+    return points[mask]
+
+
+def align_centroids(points1, points2):
+    """
+    Translate points2 to align its centroid with points1's centroid.
+
+    Args:
+        points1: numpy array of shape (n, 3) containing first set of points
+        points2: numpy array of shape (m, 3) containing second set of points
+
+    Returns:
+        translated_points2: numpy array of shape (m, 3) with aligned centroid
+    """
+    # Compute centroids
+    centroid1 = np.mean(points1, axis=0)
+    centroid2 = np.mean(points2, axis=0)
+
+    # Compute translation vector
+    translation = centroid1 - centroid2
+
+    # Apply translation to points2
+    translated_points2 = points2 + translation
+
+    return translated_points2

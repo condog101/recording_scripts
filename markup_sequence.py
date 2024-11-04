@@ -278,15 +278,18 @@ def get_3d_coordinates(coordinates_2d, depth_map, calibration):
     return points
 
 
-def pick_mesh_points(mesh, img=None):
-
-    # cv2.imshow('refwindow', img)
-    # cv2.waitKey(0)
-
-    # # closing all open windows
-    # cv2.destroyAllWindows()
+def pick_mesh_points(mesh):
 
     vis = o3d.visualization.VisualizerWithVertexSelection()
+
+    selected = []
+
+    def sel_changed():
+
+        for p in vis.get_picked_points():
+            if p.index not in selected:
+                selected.append(p.index)
+    vis.register_selection_changed_callback(sel_changed)
     vis.create_window()
 
     # Add the mesh to the visualizer
@@ -295,7 +298,7 @@ def pick_mesh_points(mesh, img=None):
     vis.run()  # user picks points
     print("")
     vis.destroy_window()
-    return vis.get_picked_points()
+    return selected
 
 
 def pick_points(pcd):
@@ -344,7 +347,8 @@ def play_single_initial_frame_mark_both(spine_mesh, playback, offset, baseline_f
                         points * scale_scene)[picked_scene_points]
 
                     picked_points_coords = pick_mesh_points(spine_mesh)
-                    picked_points = [x.coord for x in picked_points_coords]
+                    picked_points = np.asarray(spine_mesh.vertices)[
+                        picked_points_coords]
 
                     break
                     frame_index += 1
@@ -354,7 +358,7 @@ def play_single_initial_frame_mark_both(spine_mesh, playback, offset, baseline_f
 
     finally:
         playback.close()
-        return np.array([picked_points, scene_picked_points])
+        return [picked_points, scene_picked_points]
 
 
 # this might not be needed

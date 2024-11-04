@@ -1,5 +1,7 @@
 import heapq
 import numpy as np
+import open3d as o3d
+from itertools import permutations
 
 
 def get_linkage_ordering(centroid_dict):
@@ -37,13 +39,37 @@ def get_linkage_ordering(centroid_dict):
     return node_order
 
 
+def get_lower_centroid_of_vertebrae_bounding_box(vertices):
+    vector_verts = o3d.utility.Vector3dVector(vertices)
+    bounding_box = o3d.geometry.OrientedBoundingBox.create_from_points(
+        o3d.utility.Vector3dVector(vector_verts))
+    candidate_points = None
+    i = np.argsort(bounding_box.extent)[-3]
+
+    bbox1, bbox2 = split_oriented_bbox(bounding_box, i)
+    p1 = bbox1.get_point_indices_within_bounding_box(vector_verts)
+    p2 = bbox2.get_point_indices_within_bounding_box(vector_verts)
+
+    if len(p1) > len(p2):
+        return bbox1
+        candidate_points = p1
+    else:
+        return bbox2
+        candidate_points = p2
+
+
 def get_joint_positions(partition_map, mesh):
     # this gets a link
+    # I'll modify this, using the bounding box point distribution, only consider half with most points, hopefully gives
+
     vertices = np.asarray(mesh.vertices)
+    bounding_box = get_lower_centroid_of_vertebrae_bounding_box(vertices)
     centroid_dict = {}
     for key, value in partition_map.items():
         rel_vertices = vertices[value]
-        centroid_dict[key] = np.mean(rel_vertices, axis=0)
+        rel_rel_vertices = bounding_box.get_point_indices_within_bounding_box(
+            o3d.utility.Vector3dVector(rel_vertices))
+        centroid_dict[key] = np.mean(rel_vertices[rel_rel_vertices], axis=0)
 
     link_order = get_linkage_ordering(centroid_dict)
     bone_coords = []
@@ -70,3 +96,45 @@ def get_joint_positions(partition_map, mesh):
     # each vertebrae has a bone
 
     return bone_coords
+
+
+def split_oriented_bbox(bbox: o3d.geometry.OrientedBoundingBox, axis):
+    """
+    Split an OrientedBoundingBox into two equal parts along its local axis.
+
+    Parameters:
+    bbox: open3d.geometry.OrientedBoundingBox to split
+    axis: Axis enum indicating which local axis to split along
+
+    Returns:
+    tuple: (first_half_bbox, second_half_bbox) - Two new OrientedBoundingBoxes
+    """
+    # Get the original box parameters
+    center = bbox.center
+    R = bbox.R  # Rotation matrix
+    extent = bbox.extent  # Full dimensions
+
+    # Create new extent for split boxes
+    new_extent = extent.copy()
+    new_extent[axis] = extent[axis] / 2
+
+    # Calculate offset in the local coordinate system
+    offset = np.zeros(3)
+    offset[axis] = extent[axis] / 4  # Quarter of the full extent
+
+    # Transform offset to global coordinate system
+    global_offset = R @ offset
+
+    # Create the two new boxes
+    first_half_center = center - global_offset
+    second_half_center = center + global_offset
+
+    first_half_bbox = o3d.geometry.OrientedBoundingBox(
+        first_half_center, R, new_extent
+    )
+
+    second_half_bbox = o3d.geometry.OrientedBoundingBox(
+        second_half_center, R, new_extent
+    )
+
+    return first_half_bbox, second_half_bbox
