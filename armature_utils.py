@@ -43,7 +43,7 @@ def get_lower_centroid_of_vertebrae_bounding_box(vertices):
     vector_verts = o3d.utility.Vector3dVector(vertices)
     bounding_box = o3d.geometry.OrientedBoundingBox.create_from_points(
         o3d.utility.Vector3dVector(vector_verts))
-    candidate_points = None
+
     i = np.argsort(bounding_box.extent)[-3]
 
     bbox1, bbox2 = split_oriented_bbox(bounding_box, i)
@@ -52,10 +52,9 @@ def get_lower_centroid_of_vertebrae_bounding_box(vertices):
 
     if len(p1) > len(p2):
         return bbox1
-        candidate_points = p1
+
     else:
         return bbox2
-        candidate_points = p2
 
 
 def get_joint_positions(partition_map, mesh):
@@ -138,3 +137,42 @@ def split_oriented_bbox(bbox: o3d.geometry.OrientedBoundingBox, axis):
     )
 
     return first_half_bbox, second_half_bbox
+
+
+def get_bbox_overlap(points1, points2):
+    """
+    Compute overlap of bounding boxes of two point clouds.
+
+    Args:
+        points1: numpy array of shape (n, 3)
+        points2: numpy array of shape (m, 3)
+
+    Returns:
+        overlap_volume: volume of intersection
+        iou: intersection over union score
+    """
+    # Get min/max bounds for each point cloud
+    min1, max1 = np.min(points1, axis=0), np.max(points1, axis=0)
+    min2, max2 = np.min(points2, axis=0), np.max(points2, axis=0)
+
+    # Compute intersection bounds
+    intersection_min = np.maximum(min1, min2)
+    intersection_max = np.minimum(max1, max2)
+
+    # Check if boxes overlap
+    if np.any(intersection_max < intersection_min):
+        return 0.0, 0.0
+
+    # Compute volumes
+    def get_volume(min_pt, max_pt):
+        dims = max_pt - min_pt
+        return np.prod(dims)
+
+    vol1 = get_volume(min1, max1)
+    vol2 = get_volume(min2, max2)
+    intersection_vol = get_volume(intersection_min, intersection_max)
+
+    union_vol = vol1 + vol2 - intersection_vol
+    iou = intersection_vol / union_vol if union_vol > 0 else 0.0
+
+    return intersection_vol, iou

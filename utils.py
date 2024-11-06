@@ -91,7 +91,7 @@ def emd(X, Y):
     return d[assignment].sum() / min(len(X), len(Y))
 
 
-def clamp_quaternion(quat):
+def clamp_quaternion(quat, max_angle_degrees=7):
     """
     Clamp quaternion to represent at most 90 degrees rotation in any axis.
 
@@ -105,9 +105,8 @@ def clamp_quaternion(quat):
     if quat[0] < 0:
         quat = -quat
 
-    # For 90 degrees, w component should be cos(45°) = 1/√2 ≈ 0.7071
-    # Because quaternion elements represent half angles
-    min_w = np.sqrt(2) / 2
+    max_angle_rad = np.radians(max_angle_degrees) / 2
+    min_w = np.cos(max_angle_rad)
 
     if quat[0] < min_w:
         # Quaternion represents rotation > 90 degrees
@@ -115,10 +114,16 @@ def clamp_quaternion(quat):
         vec_part = quat[1:]
         vec_magnitude = np.linalg.norm(vec_part)
         if vec_magnitude > 0:
-            # Calculate new vector magnitude for 90 degree rotation
-            new_vec_magnitude = np.sqrt(1 - min_w**2)
-            vec_part = (vec_part / vec_magnitude) * new_vec_magnitude
-            quat = np.array([min_w, vec_part[0], vec_part[1], vec_part[2]])
+            if vec_magnitude > 0:
+                # Calculate new vector magnitude for max allowed rotation
+                # For angle θ, magnitude of vector part = sin(θ/2)
+                new_vec_magnitude = np.sin(max_angle_rad)
+
+                # Scale vector part while preserving direction
+                vec_part = (vec_part / vec_magnitude) * new_vec_magnitude
+
+                # Reconstruct quaternion
+                quat = np.array([min_w, vec_part[0], vec_part[1], vec_part[2]])
 
     return quat
 

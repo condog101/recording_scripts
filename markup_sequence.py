@@ -4,6 +4,7 @@ import numpy as np
 from typing import Optional, Tuple
 from pyk4a import PyK4APlayback, ImageFormat
 import open3d as o3d
+from scipy.spatial import distance_matrix
 
 import pickle
 
@@ -346,9 +347,17 @@ def play_single_initial_frame_mark_both(spine_mesh, playback, offset, baseline_f
                     scene_picked_points = (
                         points * scale_scene)[picked_scene_points]
 
+                    dist1 = distance_matrix(
+                        scene_picked_points, scene_picked_points)
+
                     picked_points_coords = pick_mesh_points(spine_mesh)
                     picked_points = np.asarray(spine_mesh.vertices)[
                         picked_points_coords]
+
+                    dist2 = distance_matrix(picked_points, picked_points)
+
+                    print(f"max distance scene {np.max(dist1)}")
+                    print(f"max distance mesh {np.max(dist2)}")
 
                     break
                     frame_index += 1

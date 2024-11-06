@@ -7,11 +7,12 @@ import pickle
 from typing import Optional
 from utils import info, remove_distant_points
 from markup_sequence import record_pointed_spots, get_3d_coordinates, raw_get_3d_coordinates, play_single_initial_frame_mark_both
-from registration import rough_register_via_correspondences, source_icp_transform
+from registration import rough_register_via_correspondences, source_icp_transform, invert_icp_point_to_plane, force_below_z_threshold
 from armature_utils import get_joint_positions
 from joints import create_armature_objects, Spine
 from collections import defaultdict
 import copy
+import itertools
 from catmull_rom import fit_catmull_rom
 
 
@@ -48,7 +49,12 @@ def get_min_max_x_y(coords_3d):
     return (min_x, min_y, max_x, max_y)
 
 
-def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset=10.0):
+def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset=0, z_percentile=0.05):
+    # try filtering bottom 20% z values
+    z_vals = np.sort(points[:, 2])
+    zlen = int(z_percentile * len(z_vals))
+    z_cap = z_vals[:len(z_vals)-zlen][-1]
+
     min_x = bbox_params[0][0]
     min_y = bbox_params[0][1]
     max_x = min_x + bbox_params[1]
@@ -65,7 +71,9 @@ def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset=1
     mask_y = (points[:, 1] > (filter_coords[1] - offset)
               ) & (points[:, 1] < (filter_coords[3] + offset))
 
-    combined_mask = mask_x & mask_y
+    mask_z = (points[:, 2] < z_cap)
+
+    combined_mask = mask_x & mask_y & mask_z
 
     return colors[combined_mask], points[combined_mask]
 
@@ -107,14 +115,64 @@ def get_rough_transform(source_points, scene_points, scale_scene):
 # 1/11/2024 - need to re-record points to check correspondence issue
 
 def clean_mesh(spine_mesh, partition):
+    reverse_mapping = {v: key for key, list_item in partition.items()
+                       for v in list_item}
+    bad_triangles = []
+    for ind, triangle in enumerate(np.asarray(spine_mesh.triangles)):
+        ref_vert = triangle[0]
+        cluster = reverse_mapping[ref_vert]
 
-    for key, vert_list in partition.items():
-        o3d.visualization.draw_geometries(
-            [spine_mesh.select_by_index(vert_list)])
+        if not all([cluster == reverse_mapping[x] for x in triangle[1:]]):
+            bad_triangles.append(ind)
+
+    spine_mesh.remove_triangles_by_index(bad_triangles)
+    spine_mesh.remove_unreferenced_vertices()
+    return
+
+
+def get_deformed_mesh(spine_mesh, partition_map, spine_spline_indices, curve_surg_points, use_cache=False):
+
+    links = get_joint_positions(partition_map, spine_mesh)
+    root_node = create_armature_objects(links, partition_map)
+    root_node.set_parents()
+
+    # instead, we want catmull rom splines
+
+    spine_obj = Spine(root_node, np.array(
+        spine_mesh.vertices), spine_spline_indices, curve_surg_points, alpha=1.0,
+        initial_transform=None)
+
+    if use_cache:
+        with open(f"fparam_cache.npy", 'rb') as f:
+            # source, destination
+            fparams = np.load(f)
+    else:
+        fparams, _ = spine_obj.run_optimization()
+        with open(f"fparam_cache.npy", 'wb+') as f:
+            # source, destination
+            np.save(f, np.array(fparams))
+
+    new_root_node = create_armature_objects(
+        links, partition_map)
+    new_root_node.set_parents()
+    spine_obj_original = Spine(new_root_node, np.array(
+        spine_mesh.vertices), spine_spline_indices, curve_surg_points, alpha=1.0)
+    spine_obj_original.apply_joint_parameters(fparams)
+    spine_obj_original.apply_joint_angles()
+
+    new_mesh = copy.deepcopy(spine_mesh)
+    new_mesh.vertices = o3d.utility.Vector3dVector(
+        spine_obj_original.vertices)
+
+    new_mesh.compute_vertex_normals()  # Recompute vertex normals
+    new_mesh.compute_triangle_normals()
+    # clean_mesh(new_mesh, partition_map)
+
+    return new_mesh
 
 
 def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short: str, mesh_filepath: Optional[str] = None,
-         baseline_frame: int = 0, record_mesh_points: bool = False, scale_scene=10.0, record_spline_points=False):
+         baseline_frame: int = 0, record_mesh_points: bool = False, scale_scene=1.0, record_spline_points=False):
 
     if record_spots:
         record_pointed_spots(playback, file_short)
@@ -169,11 +227,16 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
 
     curve_surg_points = fit_catmull_rom(surg_points_spline)
     # I think the ordering of this is wrong
-    curve_spine_points = fit_catmull_rom(
-        remove_distant_points(spine_points_spline))
+    # curve_spine_points = fit_catmull_rom(
+    #     remove_distant_points(spine_points_spline))
 
     # number of joints is number of vertebrae -1
     # number of bezier control points = number of joints + 2
+    curve_surg_points_for_icp = fit_catmull_rom(
+        surg_points_spline, sample_points=5000)
+    curve_surge_pcd = o3d.geometry.PointCloud()
+    curve_surge_pcd.points = o3d.utility.Vector3dVector(
+        curve_surg_points_for_icp)
 
     partition_map = partition(spine_mesh)
 
@@ -203,14 +266,19 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
     pcd_spine.points = spine_mesh.vertices
     pcd_spine.normals = spine_mesh.vertex_normals
 
+    identity_transform = np.array([[1., 0., 0., 0],
+                                   [0., 1., 0., 0],
+                                   [0., 0., 1., 0],
+                                   [0., 0., 0., 1.]])
+
     # do registration for 1st
 
-    visualize = False
+    visualize = True
 
     if visualize:
         vis = o3d.visualization.Visualizer()
         vis.create_window()
-
+    deformed_mesh = None
     try:
         playback.open()
 
@@ -221,65 +289,53 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
             try:
                 capture = playback.get_next_capture()
                 if capture.color is not None and capture.depth is not None:
+                    transforms = []
+                    inverse_transforms = []
                     x_c, y_c, w_c, h_c, _ = coordinates[frame_index]
                     colors, points = get_scene_geometry_from_capture(capture)
                     subsample_colors, subsample_points = subsample_mesh(
-                        colors, points, ((x_c, y_c), w_c, h_c), capture._calibration, capture.transformed_depth, offset=20.0)
+                        colors, points, ((x_c, y_c), w_c, h_c), capture._calibration, capture.transformed_depth, offset=20.0, z_percentile=0.05)
 
                     geometry.points = o3d.utility.Vector3dVector(
-                        subsample_points * scale_scene)
+                        subsample_points)
                     geometry.colors = o3d.utility.Vector3dVector(
                         (subsample_colors/255).astype('float64'))
 
+                    curve_transform = source_icp_transform(
+                        curve_surge_pcd, geometry, identity_transform, threshold=0.2
+                    )
+
+                    curve_surge_pcd.transform(curve_transform)
+
+                    geometry.points.extend(curve_surge_pcd.points)
+
                     icp_transform = source_icp_transform(
-                        pcd_spine, geometry, rough_transform, threshold=10)
+                        pcd_spine, geometry, rough_transform, threshold=0.4)
+
+                    # icp_transform = invert_icp_point_to_plane(
+                    #     pcd_spine, geometry, rough_transform, threshold=0.5)
 
                     spine_mesh.transform(icp_transform)
+                    # print(icp_transform)
+                    if first:
+                        spine_mesh = get_deformed_mesh(
+                            spine_mesh, partition_map, spine_spline_indices, curve_surg_points, use_cache=True)
 
-                    # everything below is the deformation stuff
+                    z_transform = force_below_z_threshold(
+                        spine_mesh, curve_surg_points)
+                    inverse_z_transform = np.linalg.inv(z_transform)
 
-                    links = get_joint_positions(partition_map, spine_mesh)
-                    root_node = create_armature_objects(links, partition_map)
-                    root_node.set_parents()
-
-                    # instead, we want catmull rom splines
-
-                    spine_obj = Spine(root_node, np.array(
-                        spine_mesh.vertices), spine_spline_indices, curve_surg_points, alpha=1.0,
-                        initial_transform=None)
-
-                    fparams, _ = spine_obj.run_optimization()
-
-                    new_root_node = create_armature_objects(
-                        links, partition_map)
-                    new_root_node.set_parents()
-                    spine_obj_original = Spine(new_root_node, np.array(
-                        spine_mesh.vertices), spine_spline_indices, curve_surg_points, alpha=1.0)
-                    spine_obj_original.apply_joint_parameters(fparams)
-                    spine_obj_original.apply_joint_angles()
-
-                    new_mesh = copy.deepcopy(spine_mesh)
-                    new_mesh.vertices = o3d.utility.Vector3dVector(
-                        spine_obj_original.vertices)
-
-                    new_mesh.compute_vertex_normals()  # Recompute vertex normals
-                    new_mesh.compute_triangle_normals()
-
-                    joint_spheres = []
-                    for joint in spine_obj_original.all_joints:
-                        position = joint.position
-                        sphere = o3d.geometry.TriangleMesh.create_sphere(
-                            radius=50.0)
-                        sphere.translate(position)
-                        joint_spheres.append(sphere)
-                    o3d.visualization.draw_geometries(
-                        [*joint_spheres, new_mesh])
-                    o3d.visualization.draw_geometries([spine_mesh, new_mesh])
-
-                    # everything abouve is deformation stuff
+                    spine_mesh.transform(z_transform)
+                    pcd_sample = spine_mesh.sample_points_uniformly(
+                        number_of_points=10000)
+                    icp_transform2 = source_icp_transform(
+                        pcd_sample, geometry, np.eye(4), threshold=0.4)
+                    spine_mesh.transform(icp_transform2)
 
                     inv_fine_transform = np.linalg.inv(icp_transform)
-
+                    inv_curve_transform = np.linalg.inv(curve_transform)
+                    inv_transform2 = np.linalg.inv(icp_transform2)
+                    curve_surge_pcd.transform(inv_curve_transform)
                     if visualize:
                         if first:
 
@@ -299,7 +355,17 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
                         # o3d.visualization.draw_geometries(
                         #     [source_whole_rough, source_scene_rough])
                     # spine_mesh.transform(inv_fine_transform)
+                    spine_mesh.transform(inv_transform2)
+                    spine_mesh.transform(inverse_z_transform)
                     spine_mesh.transform(inv_fine_transform)
+                    if first:
+                        spine_spline_points = fit_catmull_rom(np.asarray(spine_mesh.vertices)[
+                            spine_spline_indices], sample_points=5000)
+
+                        pcd_spine = o3d.geometry.PointCloud()
+                        pcd_spine.points = spine_mesh.vertices
+                        pcd_spine.normals = spine_mesh.vertex_normals
+                        pcd_spine.points.extend(spine_spline_points)
 
             except EOFError:
                 break

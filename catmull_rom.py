@@ -6,6 +6,7 @@ def fit_catmull_rom(points, alpha=0, sample_points=200):
 
     # this assumes points are passed in correct order, otherwise doesn't work
     # Create spline
+
     diffs = np.diff(points, axis=0)
     distances = np.sqrt(np.sum(diffs**2, axis=1))
     t = np.concatenate(([0], np.cumsum(distances)))

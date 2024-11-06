@@ -23,6 +23,15 @@ def source_icp_transform(source, target, trans_init, threshold=5):
     return reg_p2p.transformation
 
 
+def invert_icp_point_to_plane(source, target, trans_init, threshold=5):
+    reverse_init_transform = np.linalg.inv(trans_init)
+    reg_p2l = o3d.pipelines.registration.registration_icp(
+        target, source, threshold, reverse_init_transform,
+        o3d.pipelines.registration.TransformationEstimationPointToPlane())
+    reversed_transform = reg_p2l.transformation
+    return np.linalg.inv(reversed_transform)
+
+
 def preprocess_point_cloud(pcd, voxel_size, estimate_normals=True):
     print(":: Downsample with a voxel size %.3f." % voxel_size)
     pcd_down = pcd.voxel_down_sample(voxel_size)
@@ -51,3 +60,13 @@ def prepare_dataset(voxel_size, spine_pcd_source, surgical_pcd_target):
     target_down, target_fpfh = preprocess_point_cloud(
         surgical_pcd_target, voxel_size)
     return spine_pcd_source, surgical_pcd_target, source_down, target_down, source_fpfh, target_fpfh
+
+
+def force_below_z_threshold(spine_mesh, curve_points, offset=20):
+    min_z_value_scene = np.min(curve_points[:, 2])
+    min_z_value_pcd = np.min(np.asarray(spine_mesh.vertices)[:, 2])
+    transform = np.eye(4)
+    if min_z_value_scene > min_z_value_pcd:
+        diff = min_z_value_scene - min_z_value_pcd
+        transform[2, 3] = diff + offset
+    return transform
