@@ -2,7 +2,9 @@ from pyk4a import ImageFormat, PyK4APlayback
 import cv2
 import webcolors
 import numpy as np
+from collections import defaultdict
 from scipy.spatial.distance import cdist
+from scipy.spatial import distance_matrix
 from scipy.optimize import linear_sum_assignment
 
 
@@ -46,8 +48,8 @@ def info(playback: PyK4APlayback):
 
 def closest_color(requested_color):
     min_colors = {}
-    for key, name in webcolors.CSS3_HEX_TO_NAMES.items():
-        r_c, g_c, b_c = webcolors.hex_to_rgb(key)
+    for name in webcolors.names("css3"):
+        r_c, g_c, b_c = webcolors.name_to_rgb(name)
         rd = (r_c - requested_color[0]) ** 2
         gd = (g_c - requested_color[1]) ** 2
         bd = (b_c - requested_color[2]) ** 2
@@ -136,6 +138,20 @@ def normalize_list_of_quaternion_params(quatlist):
     return new_params
 
 
+def filter_z_offset_points(points, threshold_factor=2.0):
+    z_points = points[:, 2]
+    a, b = np.meshgrid(z_points, z_points)
+    distances = np.abs(a - b)
+    np.fill_diagonal(distances, np.inf)
+    min_distances = np.min(distances, axis=1)
+    threshold = np.mean(min_distances) * threshold_factor
+
+    # Keep points whose minimum distance is below threshold
+    mask = min_distances < threshold
+
+    return points[mask]
+
+
 def remove_distant_points(points, threshold_factor=2.0):
     """
     Remove points that are unusually far from their nearest neighbors.
@@ -187,3 +203,13 @@ def align_centroids(points1, points2):
     translated_points2 = points2 + translation
 
     return translated_points2
+
+
+def partition(mesh):
+    color_map = defaultdict(list)
+    colors = np.asarray(mesh.vertex_colors)
+    for ind in range(len(colors)):
+        r, g, b = colors[ind]
+        color_map[(r, g, b)].append(ind)
+    print(len(color_map))
+    return color_map

@@ -1,16 +1,25 @@
 import numpy as np
 from utils import vector_to_translation_matrix, normalize_list_of_quaternion_params
-from scipy.interpolate import Rbf
+import open3d as o3d
 from scipy.spatial.distance import directed_hausdorff
 from scipy.optimize import minimize
 from catmull_rom import fit_catmull_rom
-from utils import emd, remove_distant_points, align_centroids
+from utils import emd, remove_distant_points, align_centroids, filter_z_offset_points, partition
+from armature_utils import get_bbox_overlap
 
 
 class BallJoint:
-    def __init__(self, position):
+    def __init__(self, position, target_position, spline_points, x_constraint=4, y_constraint=18, z_constraint=8):
+        # x axis is rotation around length of spine, z axis is towards process tip, y is towards transverse process
+        # should be x:4, y:20, z:8, but increase
+
         self.initial_position = np.array(position)
+        self.initial_target_position = np.array(target_position)
         self.position = np.array(position)
+        self.target_position = target_position
+        self.spline_points = spline_points
+        self.x_constraint, self.y_constraint, self.z_constraint = x_constraint, y_constraint, z_constraint
+
         # Initialize quaternion to identity rotation [1,0,0,0]
         self.quaternion = np.array([1.0, 0.0, 0.0, 0.0])
 
@@ -19,9 +28,15 @@ class BallJoint:
         homogeneous = np.hstack([points, np.ones((len(points), 1))]).T
         transformed = (transform @ homogeneous).T[:, :3][0]
         self.position[:] = transformed[:]
+        target_points = self.target_position.reshape(1, -1)
+        homogeneous_target = np.hstack(
+            [target_points, np.ones((len(target_points), 1))]).T
+        transformed_target = (transform @ homogeneous_target).T[:, :3][0]
+        self.target_position[:] = transformed_target[:]
 
     def reset_joint_position(self):
         self.position[:] = self.initial_position[:]
+        self.target_position[:] = self.initial_target_position[:]
         self.quaternion = np.array([1.0, 0.0, 0.0, 0.0])
 
     def set_quaternion(self, quaternion):
@@ -72,18 +87,32 @@ class BallJoint:
         # Then translate
         return rotated_point + self.position
 
-    def to_matrix(self):
-        """Convert to 4x4 transformation matrix"""
-        w, x, y, z = self.quaternion
+    def constrain_rotation_matrix(self, T):
+        x_limit, y_limit, z_limit = self.x_constraint, self.y_constraint, self.z_constraint
 
-        matrix = np.array([
-            [1-2*y*y-2*z*z,  2*x*y-2*w*z,    2*x*z+2*w*y,    self.position[0]],
-            [2*x*y+2*w*z,    1-2*x*x-2*z*z,  2*y*z-2*w*x,    self.position[1]],
-            [2*x*z-2*w*y,    2*y*z+2*w*x,    1-2*x*x-2*y*y,  self.position[2]],
-            [0,              0,              0,              1]
+        rotation_only = T[0:3, 0:3]
+        axis_rotations = decompose_rotation_matrix(rotation_only)
+        conversion_factor = np.pi/180
+        x_radians, y_radians, z_radians = x_limit * conversion_factor, y_limit * \
+            conversion_factor, z_limit * conversion_factor
+
+        constrained_angles = np.array([
+            np.clip(axis_rotations[0], -x_radians, x_radians),
+            np.clip(axis_rotations[1], -y_radians, y_radians),
+            np.clip(axis_rotations[2], -z_radians, z_radians)
         ])
+        cx, cy, cz = np.cos(constrained_angles)
+        sx, sy, sz = np.sin(constrained_angles)
 
-        return matrix
+        # Build rotation matrix using XYZ order
+        Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+        Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+        Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+
+        R_constrained = Rz @ Ry @ Rx
+        T = np.eye(4)
+        T[0:3, 0:3] = R_constrained
+        return T
 
     def to_rotation_only_matrix(self):
         q = self.quaternion / np.linalg.norm(self.quaternion)
@@ -105,34 +134,75 @@ class BallJoint:
         matrix[2, 1] = 2*y*z + 2*w*x
         matrix[2, 2] = 1 - 2*x*x - 2*y*y
 
-        return matrix
+        constrained_matrix = self.constrain_rotation_matrix(matrix)
+
+        return constrained_matrix
 
 
 class Vertebrae:
+
+    def get_closest_spline_point_vector(self, joint_position):
+        closest = np.argmin(
+            np.sqrt(np.sum((self.spline_points - joint_position)**2, axis=1)))
+        vec = self.spline_points[closest] - joint_position
+        return vec / np.linalg.norm(vec)
+
+    def get_joint_axes(self, joint: BallJoint):
+        joint_position = joint.position
+        toward_position = joint.target_position
+        x_vector = toward_position - joint_position
+        x_vector = x_vector / np.linalg.norm(x_vector)
+        z_vector = find_closest_orthogonal(
+            x_vector, self.get_closest_spline_point_vector(
+                joint_position)
+        )
+        y_vector = np.cross(x_vector, z_vector)
+        return x_vector, y_vector, z_vector
 
     def initialize_joints(self):
 
         if self.tail_child is not None:
 
-            self.tail_joint = BallJoint(self.bone_positions[0])
+            self.tail_joint = BallJoint(
+                self.bone_positions[0], self.tail_child.bone_positions[0], self.spline_points)
 
         else:
             self.tail_joint = None
 
         if self.head_child is not None:
-
-            self.head_joint = BallJoint(self.bone_positions[1])
+            self.head_joint = BallJoint(
+                self.bone_positions[1], self.head_child.bone_positions[1], self.spline_points)
         else:
             self.head_joint = None
 
-    def __init__(self, bone_positions, partition_map, tail_child=None, head_child=None):
+    def __init__(self, bone_positions, partition_map, spline_points, tail_child=None, head_child=None):
         self.bone_positions = bone_positions
         self.cluster_id = bone_positions[2]
         self.vertex_ids = partition_map[self.cluster_id]
         self.tail_child = tail_child
         self.head_child = head_child
         self.parent = None
+        self.spline_points = spline_points
         self.initialize_joints()
+
+    def set_simple_mesh_points(self, spine):
+
+        spine.initial_simple_mesh_vertices
+        vertebrae_centroid = np.mean(
+            spine.initial_vertices[self.vertex_ids], axis=0)
+        min_diff = 1000
+        candidate = None
+        for key, inds in spine.partition_simple.items():
+            candidate_centroid = np.mean(spine.initial_vertices[inds], axis=0)
+            dist = np.linalg.norm(candidate_centroid - vertebrae_centroid)
+            if dist < min_diff:
+                min_diff = dist
+                candidate = key
+        self.simple_vertex_inds = spine.partition_simple[candidate]
+        if self.tail_child is not None:
+            self.tail_child.set_simple_mesh_points(spine)
+        if self.head_child is not None:
+            self.head_child.set_simple_mesh_points(spine)
 
     def get_joints_and_child_joints(self):
         joints = []
@@ -176,14 +246,20 @@ class Vertebrae:
     # to propogate transforms from current, I need to know, joint params,
     # qw, qx, qy, qz for each joint, as well as vertices affected by each joint, so for everything downstream, including joints bones vertices, etc
     # do translation from joint in question to coordinates origin, apply rotation, then back to
-    def get_downstream_indices(self):
+    def get_downstream_indices(self, ordinary_indices=True):
+
         tail_ids = []
         head_ids = []
         if self.tail_child is not None:
-            tail_ids = self.tail_child.get_downstream_indices()
+            tail_ids = self.tail_child.get_downstream_indices(
+                ordinary_indices=ordinary_indices)
         if self.head_child is not None:
-            head_ids = self.head_child.get_downstream_indices()
-        return self.vertex_ids + tail_ids + head_ids
+            head_ids = self.head_child.get_downstream_indices(
+                ordinary_indices=ordinary_indices)
+        if ordinary_indices:
+            return self.vertex_ids + tail_ids + head_ids
+        else:
+            return self.simple_vertex_inds + tail_ids + head_ids
 
     @staticmethod
     def update_single_point_position(joint, transform):
@@ -219,6 +295,10 @@ class Vertebrae:
             self.update_vertex_positions(combined_head, spine, head_indices)
             self.head_child.update_joint_positions(combined_head)
             self.head_child.propagate_joint_updates(spine)
+            head_simple_indices = self.head_child.get_downstream_indices(
+                ordinary_indices=False)
+            self.update_vertex_positions(
+                combined_head, spine, head_simple_indices, ordinary=False)
 
         if self.tail_joint is not None:
             combined_tail = self.get_sandwich_transform(self.tail_joint)
@@ -226,37 +306,79 @@ class Vertebrae:
             self.update_vertex_positions(combined_tail, spine, tail_indices)
             self.tail_child.update_joint_positions(combined_tail)
             self.tail_child.propagate_joint_updates(spine)
+            tail_simple_indices = self.tail_child.get_downstream_indices(
+                ordinary_indices=False)
+            self.update_vertex_positions(
+                combined_tail, spine, tail_simple_indices, ordinary=False)
 
     @staticmethod
-    def update_vertex_positions(transform, spine, indices):
-        spine_coords = spine.vertices[indices]
+    def update_vertex_positions(transform, spine, indices, ordinary=True):
+        if ordinary:
+            spine_coords = spine.vertices[indices]
+        else:
+            spine_coords = spine.simple_mesh_vertices[indices]
         homogeneous = np.hstack([spine_coords, np.ones(
             (len(spine_coords), 1))]).T
         transformed = (transform @ homogeneous).T[:, :3]
-        spine.vertices[indices] = transformed
+        if ordinary:
+            spine.vertices[indices] = transformed
+        else:
+            spine.simple_mesh_vertices[indices] = transformed
 
-    @staticmethod
-    def get_sandwich_transform(joint):
+    def get_sandwich_transform(self, joint: BallJoint):
+        # first bring the joint to origin, then align joint axes with world
         head_joint_translation = np.array(joint.position) * -1.0
         t1 = vector_to_translation_matrix(head_joint_translation)
+        x1, y1, z1 = self.get_joint_axes(joint)
+        rotation_alignment = align_vectors_to_axes(x1, y1, z1)
         rotation = joint.to_rotation_only_matrix()
         inv_t1 = np.linalg.inv(t1)
-        return inv_t1 @ rotation @ t1
+        inv_rotation = np.linalg.inv(rotation_alignment)
+        return inv_t1 @ inv_rotation @ rotation @ rotation_alignment @ t1
+
+    def get_submesh_voxel_error(self, vertices):
+
+        error = 0
+
+        if self.head_child is not None:
+            error += self.head_child.get_submesh_voxel_error(vertices)
+        if self.tail_child is not None:
+            error += self.tail_child.get_submesh_voxel_error(vertices)
+
+        if self.parent is not None:
+            mesh1 = vertices[
+                self.parent.vertex_ids]
+            mesh2 = vertices[
+                self.vertex_ids]
+            intersection_vol, iou = get_bbox_overlap(mesh1, mesh2)
+            error += iou
+
+        return error
 
 
 class Spine:
 
-    def __init__(self, root_vertebrae, vertices_array, control_point_inds, video_curve_points, alpha=0.5, initial_transform=None):
+    def __init__(self, root_vertebrae, vertices_array, control_point_inds, video_curve_points, alpha=0.5, initial_transform=None, simple_mesh=None):
         self.root_vertebrae = root_vertebrae
-
+        self.simple_mesh = simple_mesh
         if initial_transform is not None:
             homogeneous = np.hstack([vertices_array, np.ones(
                 (len(vertices_array), 1))]).T
             transformed = (initial_transform @ homogeneous).T[:, :3]
+
+            homogeneous_simple = np.hstack([np.asarray(simple_mesh.vertices), np.ones(
+                (len(np.asarray(simple_mesh.vertices)), 1))]).T
+            transformed_simple = (initial_transform @
+                                  homogeneous_simple).T[:, :3]
             self.initial_vertices = transformed.copy()
             self.vertices = transformed.copy()
+            self.simple_mesh_vertices = transformed_simple.copy()
+            self.initial_simple_mesh_vertices = transformed_simple.copy()
             self.root_vertebrae.update_joint_positions(initial_transform)
         else:
+            self.simple_mesh_vertices = np.asarray(simple_mesh.vertices)
+            self.initial_simple_mesh_vertices = np.asarray(
+                simple_mesh.vertices)
             self.initial_vertices = vertices_array.copy()
             self.vertices = vertices_array.copy()
         self.control_point_inds = control_point_inds
@@ -268,37 +390,56 @@ class Spine:
                                   for _ in range(0, len(self.all_joints) * 4)]
         self.alpha = alpha
 
+        self.partition_simple = partition(self.simple_mesh)
+        intersecting_triangles = np.asarray(
+            self.simple_mesh.get_self_intersecting_triangles())
+        intersecting_triangles = intersecting_triangles[0:1]
+        self.intersects = len(np.unique(intersecting_triangles))
+        self.set_simple_mesh_points()
+
+    def get_overlap_error(self):
+        self.simple_mesh.vertices = o3d.utility.Vector3dVector(
+            self.simple_mesh_vertices)
+        intersecting_triangles = np.asarray(
+            self.simple_mesh.get_self_intersecting_triangles())
+        intersecting_triangles = intersecting_triangles[0:1]
+        intersecting_triangles_len = len(np.unique(intersecting_triangles))
+        return (intersecting_triangles_len - self.intersects)/self.intersects
+
+    def set_simple_mesh_points(self):
+        self.root_vertebrae.set_simple_mesh_points(self)
+
     def reset_spine(self):
         self.vertices[:, :] = self.initial_vertices[:, :]
         self.root_vertebrae.reset_joints()
+        self.simple_mesh_vertices[:,
+                                  :] = self.initial_simple_mesh_vertices[:, :]
 
     def get_all_joints(self):
         return self.root_vertebrae.get_joints_and_child_joints()
 
     def get_current_curve_points(self):
         rel_points = self.vertices[self.control_point_inds]
-        cleaned_points = remove_distant_points(rel_points)
+        cleaned_points = filter_z_offset_points(rel_points)
+
         return fit_catmull_rom(cleaned_points, alpha=self.alpha)
 
     def get_curve_similarity(self):
+
         current_curve_points = self.get_current_curve_points()
         aligned_curve = align_centroids(
             self.video_curve_points, current_curve_points)
 
-# import open3d as o3d
-# pcd1 = o3d.geometry.PointCloud()
-# pcd1.points = o3d.utility.Vector3dVector(current_curve_points)
-# pcd2 = o3d.geometry.PointCloud()
-# pcd2.points = o3d.utility.Vector3dVector(self.video_curve_points)
-# pcd1.colors = o3d.utility.Vector3dVector(
-#     np.array([[1, 0, 0] for _ in current_curve_points]))
-# pcd2.colors = o3d.utility.Vector3dVector(
-#     np.array([[0, 1, 0] for _ in self.video_curve_points]))
-# o3d.visualization.draw_geometries([pcd1, pcd2])
-
         # return max(directed_hausdorff(self.video_curve_points, aligned_curve)[0],
         #            directed_hausdorff(aligned_curve, self.video_curve_points)[0])
-        return emd(self.video_curve_points, aligned_curve)
+        czero = np.zeros(len(current_curve_points))
+        czero.fill(np.mean(current_curve_points[:, 2]))
+
+        cscene = np.zeros(len(self.video_curve_points))
+        cscene.fill(np.mean(self.video_curve_points[:, 2]))
+        current_curve_points[:, 2] = czero
+        self.video_curve_points[:, 2] = cscene
+        return emd(self.video_curve_points, aligned_curve[40:-40])
 
     def apply_joint_parameters(self, joint_parameters):
         # joint parameters is np.array of shape NumJointsx4
@@ -312,9 +453,11 @@ class Spine:
         self.apply_joint_parameters(joint_parameters)
         self.apply_joint_angles()
         fitness = self.get_curve_similarity()
+        overlap_error = self.get_overlap_error()
         self.reset_spine()
-        print(fitness)
-        return fitness
+        # print(fitness + overlap_error*10)
+        print(fitness + overlap_error)
+        return fitness + overlap_error
 
     def objective(self, params):
         # Normalize quaternion part before transforming
@@ -329,8 +472,8 @@ class Spine:
         result = minimize(
             self.objective,
             initial_params,
-            # method='Powell',
-            method='L-BFGS-B',
+            method='Powell',
+            # method='L-BFGS-B',
             bounds=self.quaternion_bounds,
 
             options={'maxiter': max_iterations, 'disp': True, 'xtol': xtol,
@@ -345,33 +488,104 @@ class Spine:
         return final_params, result.fun
 
 
-def traverse_children(links, parent_index, partition_map):
+def traverse_children(links, parent_index, partition_map, spline_points):
     tail_child = None
     head_child = None
     if len(links) == 1:
         # this is leaf, and has no joints
-        return Vertebrae(links[0], partition_map)
+        return Vertebrae(links[0], partition_map, spline_points)
     if parent_index < len(links) - 1:
         # can go right
         # your head will be a joint
         right_children = links[parent_index + 1:]
         ind_r = 0
-        head_child = traverse_children(right_children, ind_r, partition_map)
+        head_child = traverse_children(
+            right_children, ind_r, partition_map, spline_points)
     if parent_index > 0:
         # can go left
         # your tail will be a joint
         left_children = links[: parent_index]
         ind_l = parent_index - 1
-        tail_child = traverse_children(left_children, ind_l, partition_map)
-    return Vertebrae(links[parent_index], partition_map, tail_child=tail_child, head_child=head_child)
+        tail_child = traverse_children(
+            left_children, ind_l, partition_map, spline_points)
+    return Vertebrae(links[parent_index], partition_map, spline_points, tail_child=tail_child, head_child=head_child)
     # check if going right or left is valid first
 
 
-def create_armature_objects(links, partition_map):
+def create_armature_objects(links, partition_map, spline_points):
     # links is a list of bones, defined by (tail, head position)
     # we first need to define a route node, which will be in the middle, then traverse downwards
     # joints are the head and tail of parent, and they lead to children
     # set joint parameters, figure out the fit, if good, then transform final shape
     parent_index = len(links)//2
 
-    return traverse_children(links, parent_index, partition_map)
+    return traverse_children(links, parent_index, partition_map, spline_points)
+
+
+def find_closest_orthogonal(basis_vector, target_vector):
+    """
+    Find vector orthogonal to basis_vector that's closest to target_vector
+
+    Args:
+        basis_vector: First unit vector that defines primary axis
+        target_vector: Second unit vector we want to get close to
+
+    Returns:
+        orthogonal unit vector closest to target_vector
+    """
+    # Project target onto basis
+    projection = np.dot(target_vector, basis_vector) * basis_vector
+
+    # Subtract projection to get orthogonal component
+    orthogonal = target_vector - projection
+
+    # Normalize result
+    return orthogonal / np.linalg.norm(orthogonal)
+
+
+def align_vectors_to_axes(vec_for_x, vec_for_y, vec_for_z):
+    """
+    Creates a rotation matrix that aligns three orthogonal vectors with the coordinate axes.
+
+    Args:
+        vec_for_x: 3D vector to be aligned with x-axis [1,0,0]
+        vec_for_y: 3D vector to be aligned with y-axis [0,1,0]
+        vec_for_z: 3D vector to be aligned with z-axis [0,0,1]
+
+    Returns:
+        rotation_matrix: 4x4 transformation matrix
+    """
+
+    # Create matrix from input vectors (each vector is a column)
+    source_frame = np.column_stack([vec_for_x, vec_for_y, vec_for_z])
+
+    # Create matrix for target coordinate frame
+    target_frame = np.eye(3)  # Identity matrix represents standard basis
+
+    # The rotation matrix is R = target_frame @ source_frame^T
+    rotation_matrix = target_frame @ np.linalg.inv(source_frame)
+
+    transform = np.eye(4)  # Create 4x4 identity matrix
+    transform[:3, :3] = rotation_matrix
+
+    return transform
+
+
+def decompose_rotation_matrix(R):
+    """
+    Decompose a 3x3 rotation matrix into Euler angles (in radians)
+    Using Tait-Bryan angles with order XYZ
+    """
+    # Handle numerical errors that might make values slightly out of [-1,1]
+    sy = np.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
+
+    if sy > 1e-6:
+        x = np.arctan2(R[2, 1], R[2, 2])
+        y = np.arctan2(-R[2, 0], sy)
+        z = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        x = np.arctan2(-R[1, 2], R[1, 1])
+        y = np.arctan2(-R[2, 0], sy)
+        z = 0
+
+    return np.array([x, y, z])
