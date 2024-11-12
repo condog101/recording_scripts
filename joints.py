@@ -433,7 +433,8 @@ class Spine:
         # return max(directed_hausdorff(self.video_curve_points, aligned_curve)[0],
         #            directed_hausdorff(aligned_curve, self.video_curve_points)[0])
         czero = np.zeros(len(current_curve_points))
-        czero.fill(np.mean(current_curve_points[:, 2]))
+        # czero.fill(np.mean(current_curve_points[:, 2]))
+        czero.fill(np.mean(self.video_curve_points[:, 2]))
 
         cscene = np.zeros(len(self.video_curve_points))
         cscene.fill(np.mean(self.video_curve_points[:, 2]))
