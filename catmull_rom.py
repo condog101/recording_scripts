@@ -4,7 +4,7 @@ from geomdl import BSpline, fitting
 # from geomdl.visualization import VisMPL
 
 
-def fit_catmull_rom(points, alpha=0, sample_points=100, bspline=True):
+def fit_catmull_rom(points, alpha=0, sample_points=300, bspline=True):
 
     # this assumes points are passed in correct order, otherwise doesn't work
     # Create spline

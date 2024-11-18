@@ -3,13 +3,17 @@ from utils import vector_to_translation_matrix, normalize_list_of_quaternion_par
 import open3d as o3d
 from scipy.spatial.distance import directed_hausdorff
 from scipy.optimize import minimize
+from scipy.optimize import Bounds
+from scipy.optimize import SR1
+from scipy.optimize import basinhopping
 from catmull_rom import fit_catmull_rom
 from utils import emd, remove_distant_points, align_centroids, filter_z_offset_points, partition
 from armature_utils import get_bbox_overlap
+from scipy.optimize import NonlinearConstraint
 
 
 class BallJoint:
-    def __init__(self, position, target_position, spline_points, x_constraint=4, y_constraint=18, z_constraint=8):
+    def __init__(self, position, target_position, spline_points, x_constraint=4, y_constraint=10, z_constraint=8):
         # x axis is rotation around length of spine, z axis is towards process tip, y is towards transverse process
         # should be x:4, y:20, z:8, but increase
 
@@ -187,7 +191,6 @@ class Vertebrae:
 
     def set_simple_mesh_points(self, spine):
 
-        spine.initial_simple_mesh_vertices
         vertebrae_centroid = np.mean(
             spine.initial_vertices[self.vertex_ids], axis=0)
         min_diff = 1000
@@ -358,7 +361,7 @@ class Vertebrae:
 
 class Spine:
 
-    def __init__(self, root_vertebrae, vertices_array, control_point_inds, video_curve_points, alpha=0.5, initial_transform=None, simple_mesh=None):
+    def __init__(self, root_vertebrae, vertices_array, control_point_inds, video_curve_points, corrspondence_point_inds, scene_points, query_scene, sampled_cloud, alpha=0.5, initial_transform=None, simple_mesh=None):
         self.root_vertebrae = root_vertebrae
         self.simple_mesh = simple_mesh
         if initial_transform is not None:
@@ -383,6 +386,8 @@ class Spine:
             self.vertices = vertices_array.copy()
         self.control_point_inds = control_point_inds
         self.video_curve_points = video_curve_points
+        self.correspondence_point_inds = corrspondence_point_inds
+        self.scene_points = scene_points
 
         self.all_joints = self.get_all_joints()
 
@@ -396,6 +401,31 @@ class Spine:
         intersecting_triangles = intersecting_triangles[0:1]
         self.intersects = len(np.unique(intersecting_triangles))
         self.set_simple_mesh_points()
+        self.correspondence_distance = self.get_correspondence_distance()
+        self.process_indices = self.get_tips()
+        self.process_pcd = o3d.geometry.PointCloud()
+        self.process_pcd.points = o3d.utility.Vector3dVector(
+            self.vertices[self.process_indices])
+        self.query_scene = query_scene
+        self.initial_occupancy = self.process_occupancy()
+        self.sampled_cloud = sampled_cloud
+        self.id_transform = np.eye(4)
+
+    def get_tips(self, tip_threshold=0.1):
+        quantile = np.quantile(self.vertices[:, 2], tip_threshold)
+        return np.argwhere(self.vertices[:, 2] < quantile).reshape(-1)
+
+    def get_process_error(self, threshold=0.4):
+        self.process_pcd.points = o3d.utility.Vector3dVector(
+            self.vertices[self.process_indices])
+
+        result = o3d.pipelines.registration.evaluate_registration(
+            self.process_pcd, self.sampled_cloud, threshold, self.id_transform)
+
+        correspondences = len(np.asarray(result.correspondence_set))
+        min_both = min(len(self.process_indices), len(
+            np.asarray(self.sampled_cloud.points)))
+        return (min_both - correspondences)/min_both
 
     def get_overlap_error(self):
         self.simple_mesh.vertices = o3d.utility.Vector3dVector(
@@ -404,7 +434,11 @@ class Spine:
             self.simple_mesh.get_self_intersecting_triangles())
         intersecting_triangles = intersecting_triangles[0:1]
         intersecting_triangles_len = len(np.unique(intersecting_triangles))
-        return (intersecting_triangles_len - self.intersects)/self.intersects
+        return (intersecting_triangles_len - self.intersects)
+
+    def process_occupancy(self):
+        rel_vertices = self.vertices[self.process_indices].astype(np.float32)
+        return float(np.sum((self.query_scene.compute_occupancy(rel_vertices).numpy())))
 
     def set_simple_mesh_points(self):
         self.root_vertebrae.set_simple_mesh_points(self)
@@ -422,25 +456,31 @@ class Spine:
         rel_points = self.vertices[self.control_point_inds]
         cleaned_points = filter_z_offset_points(rel_points)
 
-        return fit_catmull_rom(cleaned_points, alpha=self.alpha)
+        return fit_catmull_rom(rel_points, alpha=self.alpha)
 
     def get_curve_similarity(self):
 
         current_curve_points = self.get_current_curve_points()
-        aligned_curve = align_centroids(
-            self.video_curve_points, current_curve_points)
 
         # return max(directed_hausdorff(self.video_curve_points, aligned_curve)[0],
         #            directed_hausdorff(aligned_curve, self.video_curve_points)[0])
-        czero = np.zeros(len(current_curve_points))
-        # czero.fill(np.mean(current_curve_points[:, 2]))
-        czero.fill(np.mean(self.video_curve_points[:, 2]))
+        # czero = np.zeros(len(current_curve_points))
+        # # czero.fill(np.mean(current_curve_points[:, 2]))
+        # czero.fill(np.mean(self.video_curve_points[:, 2]))
 
-        cscene = np.zeros(len(self.video_curve_points))
-        cscene.fill(np.mean(self.video_curve_points[:, 2]))
-        current_curve_points[:, 2] = czero
-        self.video_curve_points[:, 2] = cscene
-        return emd(self.video_curve_points, aligned_curve[40:-40])
+        # cscene = np.zeros(len(self.video_curve_points))
+        # cscene.fill(np.mean(self.video_curve_points[:, 2]))
+        # current_curve_points[:, 2] = cscene
+        # self.video_curve_points[:, 2] = cscene
+
+        aligned_curve = align_centroids(
+            self.video_curve_points, current_curve_points)
+
+        min_x_vid_curve = np.min(self.video_curve_points[:, 0])
+        max_x_vid_curve = np.max(self.video_curve_points[:, 0])
+        mask_x = (aligned_curve[:, 0] > min_x_vid_curve) & (
+            aligned_curve[:, 0] < max_x_vid_curve)
+        return emd(self.video_curve_points, aligned_curve[mask_x][10:-10])
 
     def apply_joint_parameters(self, joint_parameters):
         # joint parameters is np.array of shape NumJointsx4
@@ -450,41 +490,121 @@ class Spine:
     def apply_joint_angles(self):
         self.root_vertebrae.propagate_joint_updates(self)
 
-    def get_alignment_error(self, joint_parameters):
+    def get_correspondence_distance(self):
+        mesh_points = self.vertices[self.correspondence_point_inds]
+        return np.sum(np.linalg.norm(mesh_points - self.scene_points, axis=1))
+
+    def get_correspondence_distance_error(self):
+        distance = self.get_correspondence_distance()
+        original_distance = self.correspondence_distance
+        return np.abs(distance - original_distance)/original_distance
+
+    def get_occupancy_error(self):
+        distance = self.process_occupancy()
+        original_distance = self.initial_occupancy
+        return (original_distance - distance)/original_distance
+
+    def get_alignment_error(self, joint_parameters, overlap_alpha=0.2, distance_beta=0.1, occupancy_gamma=0.5):
         self.apply_joint_parameters(joint_parameters)
         self.apply_joint_angles()
-        fitness = self.get_curve_similarity()
-        overlap_error = self.get_overlap_error()
+        # fitness = self.get_curve_similarity() * 0.1
+        # overlap_error = self.get_overlap_error()
+        overlap_error = 0
+        # correspondence_distance_error = self.get_correspondence_distance_error()
+        correspondence_distance_error = 0
+        # occupancy_error = self.get_occupancy_error()
+        process_error = self.get_process_error(threshold=0.8)
         self.reset_spine()
         # print(fitness + overlap_error*10)
-        print(fitness + overlap_error)
-        return fitness + overlap_error
+
+        # print((1-overlap_alpha-distance_beta-occupancy_gamma)*fitness + overlap_alpha *
+        #       overlap_error + correspondence_distance_error*distance_beta + occupancy_error * occupancy_gamma)
+        # return (1-overlap_alpha-distance_beta-occupancy_gamma)*fitness + overlap_alpha*overlap_error + correspondence_distance_error*distance_beta + occupancy_error * occupancy_gamma
+        print(process_error + (overlap_error*0.05) +
+              (correspondence_distance_error*0.5))
+        return process_error + (overlap_error*0.05) + \
+            (correspondence_distance_error*0.5)
 
     def objective(self, params):
         # Normalize quaternion part before transforming
         params_normalized = normalize_list_of_quaternion_params(params)
         return self.get_alignment_error(params_normalized)
 
-    def run_optimization(self, max_iterations=500, xtol=1e-8, ftol=1e-8):
+    def quaternion_constraint(self, q):
+        """Unit quaternion constraint: q[0]^2 + q[1]^2 + q[2]^2 + q[3]^2 = 1"""
+        quats = len(q)//4
+        total = 0
+        for i in range(0, quats):
+            total += np.sum(q[i*4: ((i+1)*4)])
+        return total - q
+
+    def quaternion_angle_constraint(self, q, max_angle_degrees):
+
+        quats = len(q)//4
+        total = 0
+        for i in range(0, quats):
+            w, x, y, z = q[i*4: ((i+1)*4)]
+            max_angle_rad = np.deg2rad(max_angle_degrees)
+
+            # Constraint: |w| >= cos(x/2)
+            min_w = np.cos(max_angle_rad/2)
+            w_violation = min_w - abs(w)
+
+            # Constraint: sqrt(x² + y² + z²) <= sin(x/2)
+            max_xyz = np.sin(max_angle_rad/2)
+            xyz_mag = np.sqrt(x*x + y*y + z*z)
+            xyz_violation = xyz_mag - max_xyz
+
+            total += np.maximum(w_violation, xyz_violation)
+        return total
+
+    def run_optimization(self, max_iterations=150, xtol=1e-8, ftol=1e-8):
         initial_params = np.zeros(len(self.all_joints)*4)
         for i in range(0, len(self.all_joints)):
             initial_params[i*4] = 1.0
 
-        result = minimize(
-            self.objective,
-            initial_params,
-            method='Powell',
-            # method='L-BFGS-B',
-            bounds=self.quaternion_bounds,
+        constraint = {
+            'type': 'eq',
+            'fun': self.quaternion_constraint
+        }
+        # constraint2 = NonlinearConstraint(
+        #     lambda q: self.quaternion_angle_constraint(q, max_angle_degrees=5),
+        #     -np.inf,
+        #     0
+        # )
+        minimizer_kwargs = {
+            "method": "SLSQP",  # or other method
+            "constraints": [constraint],
+            "bounds": self.quaternion_bounds
+        }
 
-            options={'maxiter': max_iterations, 'disp': True, 'xtol': xtol,
-                     'ftol': ftol, 'return_all': True}
-        )
+        # result = minimize(
+        #     self.objective,
+        #     initial_params,
+        #     # method='Powell',
+        #     # method='L-BFGS-B',
+        #     # method='trust-constr',
+        #     jac="2-point", hess=SR1(),
+        #     constraints=[constraint, constraint2],
+        #     method='COBYLA',
+        #     bounds=self.quaternion_bounds,
+        #     # options={'maxiter': max_iterations,
+        #     #          'disp': True, 'ftol': ftol, 'xtol': xtol}
+        #     options={'maxiter': max_iterations,
+        #              'disp': True}
+        # )
+        result = basinhopping(self.objective, initial_params,
+                              minimizer_kwargs=minimizer_kwargs,
+                              niter=20,  # number of basin hopping iterations
+                              T=1.0,      # temperature parameter for acceptance
+                              stepsize=0.5  # initial step size for perturbation
+                              )
 
         # Normalize final quaternion
         final_params = result.x
         print(f"optimizer succeeded: {result.success}")
         final_params = normalize_list_of_quaternion_params(final_params)
+        print(final_params)
 
         return final_params, result.fun
 

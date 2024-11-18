@@ -15,11 +15,15 @@ def rough_register_via_correspondences(source_cloud, target):
     return trans_init  # reg_p2p.transformation
 
 
-def source_icp_transform(source, target, trans_init, threshold=5):
-
-    reg_p2p = o3d.pipelines.registration.registration_icp(
-        source, target, threshold, trans_init,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint())
+def source_icp_transform(source, target, trans_init, threshold=5, plane=True):
+    if not plane:
+        reg_p2p = o3d.pipelines.registration.registration_icp(
+            source, target, threshold, trans_init,
+            o3d.pipelines.registration.TransformationEstimationPointToPoint())
+    else:
+        reg_p2p = o3d.pipelines.registration.registration_icp(
+            source, target, threshold, trans_init,
+            o3d.pipelines.registration.TransformationEstimationPointToPlane())
     return reg_p2p.transformation
 
 

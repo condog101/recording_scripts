@@ -6,6 +6,7 @@ from collections import defaultdict
 from scipy.spatial.distance import cdist
 from scipy.spatial import distance_matrix
 from scipy.optimize import linear_sum_assignment
+import open3d as o3d
 
 
 def create_bounding_box(top_left_x, top_left_y, width, height):
@@ -93,7 +94,7 @@ def emd(X, Y):
     return d[assignment].sum() / min(len(X), len(Y))
 
 
-def clamp_quaternion(quat, max_angle_degrees=7):
+def clamp_quaternion(quat, max_angle_degrees=4):
     """
     Clamp quaternion to represent at most 90 degrees rotation in any axis.
 
@@ -211,5 +212,59 @@ def partition(mesh):
     for ind in range(len(colors)):
         r, g, b = colors[ind]
         color_map[(r, g, b)].append(ind)
-    print(len(color_map))
+
     return color_map
+
+
+def average_quaternions(quaternions):
+    """
+    Calculate average quaternion
+
+    :params quaternions: is a Nx4 numpy matrix and contains the quaternions
+        to average in the rows.
+        The quaternions are arranged as (w,x,y,z), with w being the scalar
+
+    :returns: the average quaternion of the input. Note that the signs
+        of the output quaternion can be reversed, since q and -q
+        describe the same orientation
+    """
+
+    # Number of quaternions to average
+    samples = quaternions.shape[0]
+    mat_a = np.zeros(shape=(4, 4), dtype=np.float64)
+
+    for i in range(0, samples):
+        quat = quaternions[i, :]
+        # multiply quat with its transposed version quat' and add mat_a
+        mat_a = np.outer(quat, quat) + mat_a
+
+    # scale
+    mat_a = (1.0 / samples)*mat_a
+    # compute eigenvalues and -vectors
+    eigen_values, eigen_vectors = np.linalg.eig(mat_a)
+    # Sort by largest eigenvalue
+    eigen_vectors = eigen_vectors[:, eigen_values.argsort()[::-1]]
+    # return the real part of the largest eigenvector (has only real part)
+    return np.real(np.ravel(eigen_vectors[:, 0]))
+
+
+def find_points_within_radius(source_cloud, target_cloud, radius):
+    # Build KD-tree for target cloud
+    tree = o3d.geometry.KDTreeFlann(target_cloud)
+
+    # Get points from source cloud
+    source_points = np.asarray(source_cloud.points)
+
+    # Store indices of points within radius
+    indices = []
+
+    # Search for each point
+    for i, point in enumerate(source_points):
+        # Returns (num_neighbors, [indices], [distances²])
+        [k, idx, _] = tree.search_radius_vector_3d(point, radius)
+        if k > 0:
+            indices.append(i)
+
+    # Create new pointcloud with only the matching points
+    matching_cloud = source_cloud.select_by_index(indices)
+    return matching_cloud, indices

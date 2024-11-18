@@ -6,7 +6,7 @@ import open3d as o3d
 import pickle
 from scipy.spatial.transform import Rotation
 from typing import Optional
-from utils import info, remove_distant_points, filter_z_offset_points, partition, average_quaternions
+from utils import info, remove_distant_points, filter_z_offset_points, partition, average_quaternions, find_points_within_radius
 from markup_sequence import record_pointed_spots, get_3d_coordinates, raw_get_3d_coordinates, play_single_initial_frame_mark_both
 from registration import rough_register_via_correspondences, source_icp_transform, invert_icp_point_to_plane, force_below_z_threshold
 from armature_utils import get_joint_positions
@@ -15,6 +15,7 @@ from collections import defaultdict
 import copy
 from visualization_utils import create_arrow
 from catmull_rom import fit_catmull_rom, fit_weighted_bspline
+import itertools
 
 
 def get_scene_geometry_from_capture(capture):
@@ -50,7 +51,7 @@ def get_min_max_x_y(coords_3d):
     return (min_x, min_y, max_x, max_y)
 
 
-def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset_y=-0.8, offset_x=-0.8, z_percentile=0.05):
+def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset_y=0, offset_x=0, z_percentile=0.05):
     # try filtering bottom 20% z values
     z_vals = np.sort(points[:, 2])
     zlen = int(z_percentile * len(z_vals))
@@ -76,7 +77,7 @@ def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset_y
 
     combined_mask = mask_x & mask_y & mask_z
 
-    return colors[combined_mask], points[combined_mask]
+    return colors[combined_mask], points[combined_mask], coords_3d
 
 
 def get_closest_spine_indices(spine_vertex_points, spine_mesh):
@@ -121,7 +122,7 @@ def clean_mesh(spine_mesh, partition):
     return
 
 
-def get_deformed_mesh(spine_mesh, partition_map, spine_spline_indices, curve_surg_points, use_cache=True):
+def get_deformed_mesh(spine_mesh, partition_map, spine_spline_indices, curve_surg_points, spine_correspondence_indices, scene_points, query_scene, sampled_cloud, use_cache):
     cleaned_spine_points = np.asarray(spine_mesh.vertices)[
         spine_spline_indices]
     links = get_joint_positions(
@@ -161,7 +162,7 @@ def get_deformed_mesh(spine_mesh, partition_map, spine_spline_indices, curve_sur
     mesh_smp.vertex_colors = o3d.utility.Vector3dVector(np.array(remap))
 
     spine_obj = Spine(root_node, np.array(
-        spine_mesh.vertices), spine_spline_indices, curve_surg_points, alpha=1.0,
+        spine_mesh.vertices), spine_spline_indices, curve_surg_points, spine_correspondence_indices, scene_points, query_scene, sampled_cloud, alpha=1.0,
         initial_transform=None, simple_mesh=mesh_smp)
 
     if use_cache:
@@ -178,7 +179,7 @@ def get_deformed_mesh(spine_mesh, partition_map, spine_spline_indices, curve_sur
         links, partition_map, cleaned_spine_points)
     new_root_node.set_parents()
     spine_obj_original = Spine(new_root_node, np.array(
-        spine_mesh.vertices), spine_spline_indices, curve_surg_points, alpha=1.0, simple_mesh=mesh_smp)
+        spine_mesh.vertices), spine_spline_indices, curve_surg_points, spine_correspondence_indices, scene_points, query_scene, sampled_cloud, alpha=1.0, simple_mesh=mesh_smp)
     spine_obj_original.apply_joint_parameters(fparams)
     spine_obj_original.apply_joint_angles()
 
@@ -279,7 +280,8 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
     spine_points_spline = spline_list[0]
     surg_points_spline = spline_list[1]
 
-    curve_surg_points = fit_catmull_rom(surg_points_spline)
+    curve_surg_points = fit_catmull_rom(
+        filter_z_offset_points(surg_points_spline))
     # # I think the ordering of this is wrong
     # curve_spine_points = fit_catmull_rom(
     #     remove_distant_points(spine_points_spline))
@@ -299,7 +301,29 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
     for key, value in rgb_num_map.items():
         partition_map[value] = partition_map.pop(key)
 
-    # clean_mesh(spine_mesh, partition_map)
+    def get_middle_partition_vertebrae(partition_map, spine_mesh):
+        centroids = {}
+        for key, value in partition_map.items():
+            centroid = np.mean(np.asarray(spine_mesh.vertices)[value], axis=0)
+            centroids[key] = centroid
+            candidate_key = key
+        min_total_distance = 100000
+        for key, value in centroids.items():
+            distance = 0
+            for key2, value2 in centroids.items():
+                distance += np.linalg.norm(value - value2)
+            if distance < min_total_distance:
+                min_total_distance = distance
+                candidate_key = key
+        new_mesh = copy.deepcopy(spine_mesh)
+        to_remove = [x for x in partition_map.keys() if x != candidate_key]
+        combined = list(itertools.chain.from_iterable(
+            [partition_map[key] for key in to_remove]))
+
+        new_mesh.remove_vertices_by_index(combined)
+        return new_mesh
+
+    middle_mesh = get_middle_partition_vertebrae(partition_map, spine_mesh)
 
     source_points = pp_list[0]
     scene_points = pp_list[1]
@@ -313,6 +337,7 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
         source_points, spine_mesh)
 
     geometry = o3d.geometry.PointCloud()
+    whole_thing = o3d.geometry.PointCloud()
 
     frame_index = 0
 
@@ -335,9 +360,10 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
         vis = o3d.visualization.Visualizer()
         vis.create_window()
     spine_obj = None
-    sliding_window = []
+
     rolling_correspondences = 0
     rolling_rmse = 0
+    sliding_window = []
     try:
         playback.open()
 
@@ -351,56 +377,105 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
 
                     x_c, y_c, w_c, h_c, _ = coordinates[frame_index]
                     colors, points = get_scene_geometry_from_capture(capture)
-                    subsample_colors, subsample_points = subsample_mesh(
-                        colors, points, ((x_c, y_c), w_c, h_c), capture._calibration, capture.transformed_depth, offset_y=-9, offset_x=0.0, z_percentile=0.05)
+                    # x direction is up down spine
+                    # y is across
+                    subsample_colors, subsample_points, bbox_3d = subsample_mesh(
+                        colors, points, ((x_c, y_c), w_c, h_c), capture._calibration, capture.transformed_depth, offset_y=-10, offset_x=-5, z_percentile=0.05)
 
                     geometry.points = o3d.utility.Vector3dVector(
                         subsample_points)
                     geometry.colors = o3d.utility.Vector3dVector(
                         (subsample_colors/255).astype('float64'))
 
+                    whole_thing.points = o3d.utility.Vector3dVector(
+                        points)
+                    whole_thing.colors = o3d.utility.Vector3dVector(
+                        (colors/255).astype('float64'))
+
                     # curve_transform = source_icp_transform(
                     #     curve_surge_pcd, geometry, identity_transform, threshold=0.2
                     # )
                     # threshold = 0.25
                     threshold = 0.4
+                    # downsampled = geometry.voxel_down_sample(0.01)
+                    # cl, ind = downsampled.remove_statistical_outlier(nb_neighbors=20,
+                    #                                                  std_ratio=2.0)
+
+                    # sampled = downsampled.select_by_index(ind)
+
+                    # sampled.estimate_normals()
+                    # # normals look decent, can do point to plane
+                    # sampled.orient_normals_consistent_tangent_plane(
+                    #     100)
                     icp_transform = source_icp_transform(
-                        pcd_spine, geometry, rough_transform, threshold=threshold)
+                        pcd_spine, geometry, rough_transform, threshold=threshold, plane=False)
 
                     evaluation = o3d.pipelines.registration.evaluate_registration(
                         pcd_spine, geometry, threshold, icp_transform)
 
-                    # icp_transform, sliding_window = get_average_transform(
-                    #     icp_transform, sliding_window)
+                    icp_transform, sliding_window = get_average_transform(
+                        icp_transform, sliding_window)
 
                     reg_results.append(evaluation)
 
                     spine_mesh.transform(icp_transform)
-                    # print(icp_transform)
+
                     if first:
                         if use_deformed:
                             old_mesh = copy.copy(spine_mesh)
+                            subsample_colors, subsample_points, bbox_3d = subsample_mesh(
+                                colors, points, ((x_c, y_c), w_c, h_c), capture._calibration, capture.transformed_depth, offset_y=-2, offset_x=9, z_percentile=0.05)
+
+                            curve_pcd = o3d.geometry.PointCloud()
+                            curve_pcd.points = o3d.utility.Vector3dVector(
+                                subsample_points)
+                            curve_pcd.colors = o3d.utility.Vector3dVector(
+                                (subsample_colors/255).astype('float64'))
+
+                            downsampled = curve_pcd.voxel_down_sample(0.01)
+                            cl, ind = downsampled.remove_statistical_outlier(nb_neighbors=20,
+                                                                             std_ratio=2.0)
+
+                            sampled = downsampled.select_by_index(ind)
+
+                            sampled.estimate_normals()
+                            # normals look decent, can do point to plane
+                            sampled.orient_normals_consistent_tangent_plane(
+                                100)
+                            # alpha_shape = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(
+                            #     sampled, 50)
+
+                            # convex = alpha_shape.compute_convex_hull()[0]
+                            # convex_mesh = o3d.t.geometry.TriangleMesh.from_legacy(
+                            #     convex)
+                            scene = o3d.t.geometry.RaycastingScene()
+                            # _ = scene.add_triangles(convex_mesh)
+                            o3d.visualization.draw_geometries(
+                                [spine_mesh, geometry])
+                            use_cache = False
                             spine_mesh, spine_obj = get_deformed_mesh(
-                                spine_mesh, partition_map, spine_spline_indices, curve_surg_points, use_cache=True)
+                                spine_mesh, partition_map, spine_spline_indices, curve_surg_points, spine_correspondence_indices, scene_points, scene, curve_pcd, use_cache)
 
                     # z_transform = force_below_z_threshold(
-                    #     spine_mesh, curve_surg_points, offset=5)
+                    #     spine_mesh, curve_surg_points, offset=10)
 
                     # spine_mesh.transform(z_transform)
                     # pcd_sample = spine_mesh.sample_points_uniformly(
                     #     number_of_points=10000)
                     # icp_transform2 = source_icp_transform(
-                    #     pcd_sample, geometry, np.eye(4), threshold=0.8)
+                    #     pcd_sample, geometry, np.eye(4), threshold=0.5)
                     # spine_mesh.transform(icp_transform2)
-
+                    # height matching better if only pick points on process
                     if visualize:
                         if first:
 
-                            vis.add_geometry(geometry)
+                            # vis.add_geometry(geometry)
+                            vis.add_geometry(whole_thing)
                             vis.add_geometry(spine_mesh)
                             first = False
                         else:
-                            vis.update_geometry(geometry)
+                            # vis.update_geometry(geometry)
+                            vis.add_geometry(whole_thing)
                             vis.update_geometry(spine_mesh)
 
                         vis.poll_events()
@@ -424,16 +499,29 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
                                 spine_correspondence_indices = get_closest_vertices(
                                     rough_correspondence_vertices, np.asarray(spine_mesh.vertices))
                                 # o3d.visualization.draw_geometries(
-                                #     [*spheres, *arrows, spine_mesh, old_mesh])
-                                downsampled = geometry.voxel_down_sample(0.05)
-                                cl, ind = downsampled.remove_statistical_outlier(nb_neighbors=20,
-                                                                                 std_ratio=2.0)
-                                sampled = downsampled.select_by_index(ind)
-                                tetra_mesh, pt_map = o3d.geometry.TetraMesh.create_from_point_cloud(
-                                    sampled)
-                                convex = tetra_mesh.compute_convex_hull()[0]
+                                #     [*spheres, *arrows, spine_mesh])
+
+                                # pcd_spine = o3d.geometry.PointCloud()
+                                # pcd_spine.points = spine_mesh.vertices
+                                # pcd_spine.normals = spine_mesh.vertex_normals
+                                pcd_spine = spine_mesh.sample_points_uniformly(
+                                    number_of_points=10000)
+                                pcd_spine = spine_mesh.sample_points_poisson_disk(
+                                    number_of_points=3000, pcl=pcd_spine)
+                                # o3d.visualization.draw_geometries(
+                                #     [*spheres, *arrows, pcd_spine])
+                                matching_cloud, matching_indices = find_points_within_radius(
+                                    whole_thing, pcd_spine, radius=8)
                                 o3d.visualization.draw_geometries(
-                                    [spine_mesh, convex])
+                                    [spine_mesh, whole_thing])
+
+                                new_whole_thing = copy.deepcopy(whole_thing)
+                                new_whole_thing_colors = np.asarray(
+                                    new_whole_thing.colors)
+                                new_whole_thing_colors[matching_indices] = np.array(
+                                    [[255, 165, 0] for _ in range(len(matching_indices))])
+                                new_whole_thing.colors = o3d.utility.Vector3dVector(
+                                    new_whole_thing_colors)
 
                     inv_fine_transform = np.linalg.inv(icp_transform)
 
@@ -445,17 +533,17 @@ def play(playback: PyK4APlayback, offset: float, record_spots: bool, file_short:
                     spine_mesh.transform(inv_fine_transform)
                     if first:
 
-                        pcd = spine_mesh.sample_points_uniformly(
-                            number_of_points=len(np.array(spine_mesh.vertices))//2)
-                        print("sampling points")
-                        pcd_spine = spine_mesh.sample_points_poisson_disk(
-                            number_of_points=len(np.array(spine_mesh.vertices))//10, pcl=pcd)
+                        # pcd = spine_mesh.sample_points_uniformly(
+                        #     number_of_points=len(np.array(spine_mesh.vertices))//2)
+                        # print("sampling points")
+                        # pcd_spine = spine_mesh.sample_points_poisson_disk(
+                        #     number_of_points=len(np.array(spine_mesh.vertices))//10, pcl=pcd)
 
-                        # pcd_spine = o3d.geometry.PointCloud()
-                        # pcd_spine.points = spine_mesh.vertices
-                        # pcd_spine.normals = spine_mesh.vertex_normals
-                        rough_transform = get_rough_transform(
-                            np.asarray(spine_mesh.vertices)[spine_correspondence_indices], scene_points, scale_scene)
+                        # # pcd_spine = o3d.geometry.PointCloud()
+                        # # pcd_spine.points = spine_mesh.vertices
+                        # # pcd_spine.normals = spine_mesh.vertex_normals
+                        # rough_transform = get_rough_transform(
+                        #     np.asarray(spine_mesh.vertices)[spine_correspondence_indices], scene_points, scale_scene)
                         first = False
                     print(f"frame {frame_index}")
                     rolling_correspondences = ((

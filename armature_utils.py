@@ -39,22 +39,38 @@ def get_linkage_ordering(centroid_dict):
     return node_order
 
 
+def get_box_with_lowest_z_value(bounding_box, splits=2):
+    split_box = bounding_box
+    for i in range(0, splits):
+        max_z_value = -100000
+        candidate_box = None
+        for axis in range(0, 3):
+            bbox1, bbox2 = split_oriented_bbox(split_box, axis)
+            c1 = bbox1.get_center()
+            c2 = bbox2.get_center()
+
+            if c1[2] > max_z_value or c2[2] > max_z_value:
+                if c1[2] > c2[2]:
+                    max_z_value = c1[2]
+                    candidate_box = bbox1
+                else:
+                    max_z_value = c2[2]
+                    candidate_box = bbox2
+        split_box = candidate_box
+        candidate_box = None
+    return split_box
+
+
 def get_lower_centroid_of_vertebrae_bounding_box(vertices):
     vector_verts = o3d.utility.Vector3dVector(vertices)
     bounding_box = o3d.geometry.OrientedBoundingBox.create_from_points(
         o3d.utility.Vector3dVector(vector_verts))
 
-    i = np.argsort(bounding_box.extent)[-3]
+    minimal_bounding_box = bounding_box.get_minimal_oriented_bounding_box()
 
-    bbox1, bbox2 = split_oriented_bbox(bounding_box, i)
-    p1 = bbox1.get_point_indices_within_bounding_box(vector_verts)
-    p2 = bbox2.get_point_indices_within_bounding_box(vector_verts)
+    bbox = get_box_with_lowest_z_value(minimal_bounding_box)
 
-    if len(p1) > len(p2):
-        return bbox1
-
-    else:
-        return bbox2
+    return bbox
 
 
 def get_joint_positions(partition_map, mesh):
@@ -62,10 +78,12 @@ def get_joint_positions(partition_map, mesh):
     # I'll modify this, using the bounding box point distribution, only consider half with most points, hopefully gives
 
     vertices = np.asarray(mesh.vertices)
-    bounding_box = get_lower_centroid_of_vertebrae_bounding_box(vertices)
+
     centroid_dict = {}
     for key, value in partition_map.items():
         rel_vertices = vertices[value]
+        bounding_box = get_lower_centroid_of_vertebrae_bounding_box(
+            rel_vertices)
         rel_rel_vertices = bounding_box.get_point_indices_within_bounding_box(
             o3d.utility.Vector3dVector(rel_vertices))
         centroid_dict[key] = np.mean(rel_vertices[rel_rel_vertices], axis=0)
