@@ -7,6 +7,11 @@ from scipy.spatial.distance import cdist
 from scipy.spatial import distance_matrix
 from scipy.optimize import linear_sum_assignment
 import open3d as o3d
+from scipy.spatial.transform import Rotation
+from tqdm import tqdm
+
+
+X_LIMIT, Y_LIMIT, Z_LIMIT = 0.2, 1, 1
 
 
 def create_bounding_box(top_left_x, top_left_y, width, height):
@@ -94,48 +99,11 @@ def emd(X, Y):
     return d[assignment].sum() / min(len(X), len(Y))
 
 
-def clamp_quaternion(quat, max_angle_degrees=4):
-    """
-    Clamp quaternion to represent at most 90 degrees rotation in any axis.
-
-    Args:
-        quat: numpy array [w, x, y, z] where w is the scalar component
-
-    Returns:
-        clamped quaternion
-    """
-    # Ensure w is positive (this makes the angle interpretation simpler)
-    if quat[0] < 0:
-        quat = -quat
-
-    max_angle_rad = np.radians(max_angle_degrees) / 2
-    min_w = np.cos(max_angle_rad)
-
-    if quat[0] < min_w:
-        # Quaternion represents rotation > 90 degrees
-        # Scale vector part to maintain direction but reduce magnitude
-        vec_part = quat[1:]
-        vec_magnitude = np.linalg.norm(vec_part)
-        if vec_magnitude > 0:
-            if vec_magnitude > 0:
-                # Calculate new vector magnitude for max allowed rotation
-                # For angle θ, magnitude of vector part = sin(θ/2)
-                new_vec_magnitude = np.sin(max_angle_rad)
-
-                # Scale vector part while preserving direction
-                vec_part = (vec_part / vec_magnitude) * new_vec_magnitude
-
-                # Reconstruct quaternion
-                quat = np.array([min_w, vec_part[0], vec_part[1], vec_part[2]])
-
-    return quat
-
-
 def normalize_list_of_quaternion_params(quatlist):
     new_params = quatlist.copy()
     for i in range(0, len(quatlist), 4):
-        new_params[i:i+4] = clamp_quaternion(quatlist[i:i+4] /
-                                             np.linalg.norm(quatlist[i:i+4]))
+        new_params[i:i +
+                   4], _ = clamp_quaternion_rotation_by_axis(quatlist[i:i+4])
     return new_params
 
 
@@ -268,3 +236,124 @@ def find_points_within_radius(source_cloud, target_cloud, radius):
     # Create new pointcloud with only the matching points
     matching_cloud = source_cloud.select_by_index(indices)
     return matching_cloud, indices
+
+
+def decompose_rotation_matrix(R):
+    """
+    Decompose a 3x3 rotation matrix into Euler angles (in radians)
+    Using Tait-Bryan angles with order XYZ
+    """
+    # Handle numerical errors that might make values slightly out of [-1,1]
+    sy = np.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
+
+    if sy > 1e-6:
+        x = np.arctan2(R[2, 1], R[2, 2])
+        y = np.arctan2(-R[2, 0], sy)
+        z = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        x = np.arctan2(-R[1, 2], R[1, 1])
+        y = np.arctan2(-R[2, 0], sy)
+        z = 0
+
+    return np.array([x, y, z])
+
+
+def clamp_quaternion_rotation_by_axis(quaternion, x_limit=X_LIMIT, y_limit=Y_LIMIT, z_limit=Z_LIMIT):
+    """
+    This function takes in a quaternion, and clamps the rotation per axis before returning as a constrained normalized quaternion"""
+    norm_quaternion = quaternion/np.linalg.norm(quaternion)
+    conversion_factor = np.pi/180
+    x_radians, y_radians, z_radians = x_limit * conversion_factor, y_limit * \
+        conversion_factor, z_limit * conversion_factor
+    rot_matrix = Rotation.from_quat(
+        norm_quaternion, scalar_first=True).as_matrix()
+    axis_rotations = decompose_rotation_matrix(rot_matrix)
+    constrained_angles = np.array([
+        np.clip(axis_rotations[0], -x_radians, x_radians),
+        np.clip(axis_rotations[1], -y_radians, y_radians),
+        np.clip(axis_rotations[2], -z_radians, z_radians)
+    ])
+    cx, cy, cz = np.cos(constrained_angles)
+    sx, sy, sz = np.sin(constrained_angles)
+
+    # Build rotation matrix using XYZ order
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    R_constrained = Rz @ Ry @ Rx
+    r = Rotation.from_matrix(np.array(R_constrained))
+    quaternion = r.as_quat(scalar_first=True)
+    return quaternion/np.linalg.norm(quaternion), R_constrained
+
+
+def find_closest_orthogonal(basis_vector, target_vector):
+    """
+    Find vector orthogonal to basis_vector that's closest to target_vector
+
+    Args:
+        basis_vector: First unit vector that defines primary axis
+        target_vector: Second unit vector we want to get close to
+
+    Returns:
+        orthogonal unit vector closest to target_vector
+    """
+    # Project target onto basis
+    projection = np.dot(target_vector, basis_vector) * basis_vector
+
+    # Subtract projection to get orthogonal component
+    orthogonal = target_vector - projection
+
+    # Normalize result
+    return orthogonal / np.linalg.norm(orthogonal)
+
+
+def align_vectors_to_axes(vec_for_x, vec_for_y, vec_for_z):
+    """
+    Creates a rotation matrix that aligns three orthogonal vectors with the coordinate axes.
+
+    Args:
+        vec_for_x: 3D vector to be aligned with x-axis [1,0,0]
+        vec_for_y: 3D vector to be aligned with y-axis [0,1,0]
+        vec_for_z: 3D vector to be aligned with z-axis [0,0,1]
+
+    Returns:
+        rotation_matrix: 4x4 transformation matrix
+    """
+
+    # Create matrix from input vectors (each vector is a column)
+    source_frame = np.column_stack([vec_for_x, vec_for_y, vec_for_z])
+
+    # Create matrix for target coordinate frame
+    target_frame = np.eye(3)  # Identity matrix represents standard basis
+
+    # The rotation matrix is R = target_frame @ source_frame^T
+    rotation_matrix = target_frame @ np.linalg.inv(source_frame)
+
+    transform = np.eye(4)  # Create 4x4 identity matrix
+    transform[:3, :3] = rotation_matrix
+
+    return transform
+
+
+def get_closest_indices(vertex_points, candidate_cloud):
+    """
+    vertex points is points you want to find matches to, candidate cloud is the cloud we're finding matches within.
+    both are numpy arrays, of shape Nx3
+    """
+    matching_indices = []
+    print("getting closest points")
+    for point in vertex_points:
+        norms = np.linalg.norm(candidate_cloud - point, axis=1)
+        print(np.min(norms))
+        matching_indices.append(
+            np.argmin(norms))
+    return np.array(matching_indices)
+
+
+def get_new_mapping(vertex_mapping, original_vertices, new_vertices):
+    new_dict = defaultdict(set)
+    for (index, cluster) in tqdm(vertex_mapping.items()):
+        norms = np.linalg.norm(new_vertices - original_vertices[index], axis=1)
+
+        new_dict[cluster].add(np.argmin(norms))
+    return new_dict
