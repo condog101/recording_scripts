@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.spatial import cKDTree
+import open3d as o3d
 
 
 class PCDSurface:
@@ -54,4 +55,23 @@ class PCDSurface:
             dist = np.dot(vec, normal)
             results[i] = np.sign(dist)
 
+        return results
+
+
+class o3DSurface:
+    def __init__(self, pcd):
+
+        self.normals = np.asarray(pcd.normals)
+        self.points = np.asarray(pcd.points)
+        self.tree = cKDTree(self.points)
+
+    def check_point_position(self, query_points):
+        results = np.zeros(len(query_points))
+        for i, point in enumerate(query_points):
+            _, idx = self.tree.query(point, k=1)
+            # go from surface to qury point
+            vec = point - self.points[idx]
+            dist = np.dot(
+                vec, self.normals[idx])
+            results[i] = np.sign(dist)
         return results

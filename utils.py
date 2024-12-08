@@ -11,7 +11,8 @@ from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 
 
-X_LIMIT, Y_LIMIT, Z_LIMIT = 0.2, 1, 1
+# X_LIMIT, Y_LIMIT, Z_LIMIT = 0.2, 1, 1
+X_LIMIT, Y_LIMIT, Z_LIMIT = 3, 8, 15
 
 
 def create_bounding_box(top_left_x, top_left_y, width, height):
@@ -286,6 +287,23 @@ def clamp_quaternion_rotation_by_axis(quaternion, x_limit=X_LIMIT, y_limit=Y_LIM
     return quaternion/np.linalg.norm(quaternion), R_constrained
 
 
+def generate_rotation_matrix(axis_rotations):
+    """
+    This function takes in a quaternion, and clamps the rotation per axis before returning as a constrained normalized quaternion"""
+
+    cx, cy, cz = np.cos(axis_rotations)
+    sx, sy, sz = np.sin(axis_rotations)
+
+    # Build rotation matrix using XYZ order
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    R_constrained = Rz @ Ry @ Rx
+    r = Rotation.from_matrix(np.array(R_constrained))
+    quaternion = r.as_quat(scalar_first=True)
+    return quaternion/np.linalg.norm(quaternion), R_constrained
+
+
 def find_closest_orthogonal(basis_vector, target_vector):
     """
     Find vector orthogonal to basis_vector that's closest to target_vector
@@ -357,3 +375,35 @@ def get_new_mapping(vertex_mapping, original_vertices, new_vertices):
 
         new_dict[cluster].add(np.argmin(norms))
     return new_dict
+
+
+def get_average_transform(transform, sliding_window, window_size=5):
+    rotation = transform[:3, :3]
+    translation = transform[:3, 3]
+    r = Rotation.from_matrix(np.array(rotation))
+    quaternion = r.as_quat(scalar_first=True)
+
+    if len(sliding_window) == 0:
+        sliding_window.append((translation, quaternion))
+        return transform, sliding_window
+    else:
+
+        if len(sliding_window) == window_size:
+            sliding_window.pop(0)
+        translations = [x[0] for x in sliding_window]
+        rotations = [x[1] for x in sliding_window]
+        translations.append(translation)
+        avg_translation = np.mean(np.array(translations), axis=0)
+
+        # try basic rotation averaging
+        rotations.append(quaternion)
+
+        avg_rotation = average_quaternions(np.array(rotations))
+        sliding_window.append((translation, quaternion))
+
+        rotation_matrix_back = Rotation.from_quat(
+            avg_rotation, scalar_first=True).as_matrix()
+        ema_matrices = np.eye(4)
+        ema_matrices[:3, :3] = rotation_matrix_back
+        ema_matrices[:3, 3] = avg_translation
+        return ema_matrices, sliding_window
