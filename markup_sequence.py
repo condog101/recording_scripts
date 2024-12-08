@@ -1,14 +1,15 @@
-from argparse import ArgumentParser
+
 import cv2
 import numpy as np
-from typing import Optional, Tuple
+
 from pyk4a import PyK4APlayback, ImageFormat
 import open3d as o3d
 from scipy.spatial import distance_matrix
 
 import pickle
 
-from utils import create_bounding_box, is_closest_to_keypoints, get_scene_image_from_capture, info, get_color_name, get_scene_geometry_from_capture
+from utils import get_scene_image_from_capture, info, get_color_name, get_scene_geometry_from_capture
+from registration import source_icp_transform
 
 
 COLORS = [(r, g, b) for r in [0, 255] for g in [0, 255] for b in [0, 255]]
@@ -414,3 +415,42 @@ def play_single_initial_frame(spine_mesh, playback, offset, baseline_frame, coor
     finally:
         playback.close()
         return picked_points
+
+
+def get_scene_geometry_from_capture(capture):
+    capture._color = cv2.cvtColor(cv2.imdecode(
+        capture.color, cv2.IMREAD_COLOR), cv2.COLOR_BGR2BGRA)
+    capture._color_format = ImageFormat.COLOR_BGRA32
+    points = capture.transformed_depth_point_cloud.reshape(
+        (-1, 3)).astype('float64')
+    colors = capture.color[..., (2, 1, 0)].reshape(
+        (-1, 3))
+
+    return colors, points
+
+
+def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset_y=0, offset_x=0, z_percentile=0.05):
+
+    quantile = np.quantile(points[:, 2], z_percentile)
+    mask_z = points[:, 2] > quantile
+
+    min_x = bbox_params[0][0] - offset_x
+    min_y = bbox_params[0][1] - offset_y
+    max_x = min_x + bbox_params[1] + 2*offset_x
+    max_y = min_y + bbox_params[2] + 2*offset_y
+
+    point_coords = [(min_x, min_y),
+                    (max_x, max_y)]
+    coords_3d = [raw_get_3d_coordinates(x, depth_map, calibration)
+                 for x in point_coords]
+    min_x_3d, min_y_3d, _ = coords_3d[0]
+    max_x_3d, max_y_3d, _ = coords_3d[1]
+    mask_x = (points[:, 0] > min_x_3d
+              ) & (points[:, 0] < max_x_3d)
+
+    mask_y = (points[:, 1] > min_y_3d
+              ) & (points[:, 1] < max_y_3d)
+
+    combined_mask = mask_x & mask_y & mask_z
+
+    return colors[combined_mask], points[combined_mask]
