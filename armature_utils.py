@@ -8,7 +8,7 @@ def get_linkage_ordering(centroid_dict):
 
     total_heap = []
     distance_matrix = np.zeros(shape=(len(centroid_dict), len(centroid_dict)))
-
+    # for each centroid, get furthest centroids to them
     for key, value in centroid_dict.items():
         local_heap = []
         # key is now numeric value
@@ -123,7 +123,7 @@ def get_joint_positions(partition_map, mesh, splits=1, spine_points=None):
 
     l_tail = bone_coords[0][0]
     r_head = bone_coords[-1][1]
-
+    # tail of first link is simply centroid of vertebrae 1, head of last link is centroid of last vertebrae
     bone_coords.append((r_head, centroid_dict[link_order[-1]], link_order[-1]))
     bone_coords = [(centroid_dict[link_order[0]],
                     l_tail, link_order[0])] + bone_coords

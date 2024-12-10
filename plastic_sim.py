@@ -1,12 +1,12 @@
 import open3d as o3d
-
-import open3d as o3d
+import open3d.visualization as vis
 from argparse import ArgumentParser
 import numpy as np
 from markup_sequence import pick_mesh_points, pick_points
 from armature_utils import get_joint_positions
 from visualization_utils import create_arrow
-from joints import create_armature_objects, Spine
+# from joints import create_armature_objects, Spine
+from joints_tail_root import create_armature_objects, Spine
 from collections import defaultdict
 from registration import rough_register_via_correspondences, source_icp_transform
 from utils import get_closest_indices, find_points_within_radius
@@ -45,7 +45,9 @@ def cull_small_clusters(mesh, clusters, cluster_n_triangles):
 def get_spine_obj(spine_mesh, partition_map, spine_spline_indices, scene_points, sampled_cloud, spine_points, pcd_spine, new_partition_map, splits=2):
     cleaned_spine_points = np.asarray(spine_mesh.vertices)[
         spine_spline_indices]
-
+    mean_spine = np.mean(cleaned_spine_points, axis=0)
+    centroid = np.mean(np.asarray(spine_mesh.vertices), axis=0)
+    upvector = (mean_spine - centroid)/np.linalg.norm((mean_spine - centroid))
     reverse_partition_map = {}
     for key, vals in partition_map.items():
         for val in vals:
@@ -54,16 +56,16 @@ def get_spine_obj(spine_mesh, partition_map, spine_spline_indices, scene_points,
     links = get_joint_positions(
         partition_map, spine_mesh, splits=splits, spine_points=spine_points)
     root_node = create_armature_objects(
-        links, new_partition_map, cleaned_spine_points)
+        links, new_partition_map, cleaned_spine_points, upvector, np.asarray(spine_mesh.vertices))
     root_node.set_parents()
 
     new_root_node = create_armature_objects(
-        links, partition_map, cleaned_spine_points)
+        links, partition_map, cleaned_spine_points, upvector, np.asarray(spine_mesh.vertices))
     new_root_node.set_parents()
 
     return Spine(root_node, np.asarray(
-        pcd_spine.points), cleaned_spine_points, scene_points, sampled_cloud, alpha=1.0, beta=0, threshold=10, normal_cloud=sampled_cloud, tip_threshold=0.7), Spine(new_root_node, np.asarray(
-            spine_mesh.vertices), cleaned_spine_points, scene_points, sampled_cloud, alpha=0.9, beta=0.1, threshold=0.4, normal_cloud=sampled_cloud, tip_threshold=0.4)
+        pcd_spine.points), cleaned_spine_points, scene_points, sampled_cloud, upvector, alpha=1.0, beta=0, threshold=10, normal_cloud=sampled_cloud, tip_threshold=0.7), Spine(new_root_node, np.asarray(
+            spine_mesh.vertices), cleaned_spine_points, scene_points, sampled_cloud, upvector, alpha=0.9, beta=0.1, threshold=0.4, normal_cloud=sampled_cloud, tip_threshold=0.4)
 
 
 def subsample_mesh(mesh, clusters, points):
@@ -199,6 +201,46 @@ def pick_all_points(mesh, pcd, clusters, repick):
     return picked_process_points, picked_vertices, picked_mesh_correspondence_vertices, picked_cloud_points, clusters
 
 
+def visualize_with_joints(mesh, arrows, spheres):
+    mat_box = vis.rendering.MaterialRecord()
+    # mat_box.shader = 'defaultLitTransparency'
+    mat_box.shader = 'defaultLitSSR'
+    mat_box.base_color = [0.467, 0.467, 0.467, 0.2]
+    mat_box.base_roughness = 0.0
+    mat_box.base_reflectance = 0.0
+    mat_box.base_clearcoat = 1.0
+    mat_box.thickness = 1.0
+    mat_box.transmission = 1.0
+    mat_box.absorption_distance = 0.5
+    mat_box.absorption_color = [0.5, 0.5, 0.5]
+
+    mat_spheres = []
+    for ind, sphere in enumerate(spheres):
+        mat_sphere = vis.rendering.MaterialRecord()
+        mat_sphere.shader = 'defaultLit'
+
+        mat_sphere.base_color = np.array([0.5, 0.5, 0.5, 1]).reshape(4, 1)
+        mat_spheres.append(
+            {'name': f"sphere_{ind}", 'geometry': sphere, 'material': mat_box})
+
+    mat_arrows = []
+    for ind, arrow in enumerate(arrows):
+        mat_arrow = vis.rendering.MaterialRecord()
+        mat_arrow.shader = 'defaultLit'
+        colors = list(
+            np.asarray(arrow.vertex_colors)[0])
+        colors.append(1.0)
+        colors = np.array(colors).reshape(4, 1)
+        mat_arrow.base_color = colors
+        mat_arrows.append(
+            {'name': f"arrow_{ind}", 'geometry': arrow, 'material': mat_arrow})
+
+    mesh_attr = {'name': 'box', 'geometry': mesh, 'material': mat_box}
+
+    geoms = [mesh_attr] + mat_arrows + mat_spheres
+    vis.draw(geoms)
+
+
 def main(path, mesh_path, repick):
 
     mesh = o3d.io.read_triangle_mesh(mesh_path)
@@ -274,7 +316,13 @@ def main(path, mesh_path, repick):
 
     spine_obj, spine_obj_to_deform = get_spine_obj(mesh, partition_map, picked_process_points, np.asarray(
         matching_cloud.points), matching_cloud, spine_points, pcd_spine, new_partition_map,  splits=1)
-    fparams, _ = spine_obj.run_optimization()
+    fparams = np.array([33, 2, -39, 40, -16, 6, -3, 0, 0, 0, -2, -1])
+    spheres, arrow = get_joints_with_axes(spine_obj)
+    visualize_with_joints(mesh, arrow, spheres)
+    fparams = [0 for _ in range((len(spheres)+2)*3)]
+    for i in range(len(spheres)):
+        fparams[(i*3)+1] = 40
+    # fparams, _ = spine_obj.run_optimization()
     joint_params = fparams[:-6]
     global_params = fparams[-6:]
     joint_params, global_params = spine_obj.convert_degree_params_to_radians(
@@ -283,10 +331,14 @@ def main(path, mesh_path, repick):
     spine_obj_to_deform.apply_global_transform()
     spine_obj_to_deform.apply_joint_parameters(joint_params)
     spine_obj_to_deform.apply_joint_angles()
+
+    spheres, arrow = get_joints_with_axes(spine_obj_to_deform)
     new_mesh = copy.deepcopy(mesh)
     new_mesh.vertices = o3d.utility.Vector3dVector(
         spine_obj_to_deform.vertices)
-    spheres, arrow = get_joints_with_axes(spine_obj_to_deform)
+
+    visualize_with_joints(new_mesh, arrow, spheres)
+
     o3d.visualization.draw_geometries([new_mesh, pcd])
     # L4,L3,L2,L1
     # saved fparam
