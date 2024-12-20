@@ -8,7 +8,7 @@ from scipy.spatial import distance_matrix
 
 import pickle
 
-from utils import get_scene_image_from_capture, info, get_color_name, get_scene_geometry_from_capture
+from utils import get_scene_image_from_capture, info, get_color_name, get_scene_geometry_from_capture, get_average_transform, find_points_within_radius
 from registration import source_icp_transform
 
 
@@ -256,6 +256,42 @@ def record_pointed_spots(playback: PyK4APlayback, short_file: str):
     print('assign bounding box')
 
 
+def find_closest_valid_coordinate(depth_image, x, y, window_size=20):
+    """
+    Find the closest valid coordinate with depth data within a search window.
+
+    Args:
+        depth_image: 2D numpy array of depth values
+        x, y: Original coordinates to check
+        window_size: Size of the search window (odd number)
+
+    Returns:
+        tuple: (valid_x, valid_y) or None if no valid coordinate found
+    """
+    height, width = depth_image.shape
+    min_dist = float('inf')
+    valid_coord = None
+
+    # Define search window boundaries
+    start_y = max(0, y - window_size//2)
+    end_y = min(height, y + window_size//2 + 1)
+    start_x = max(0, x - window_size//2)
+    end_x = min(width, x + window_size//2 + 1)
+
+    # Search for valid coordinates
+    for cy in range(start_y, end_y):
+        for cx in range(start_x, end_x):
+            # Check if depth value is valid (non-zero)
+            if depth_image[cy, cx] > 0:
+                # Calculate distance from original point
+                dist = np.sqrt((x - cx)**2 + (y - cy)**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    valid_coord = (cx, cy)
+
+    return valid_coord
+
+
 def raw_get_3d_coordinates(coordinates_2d: tuple, depth_map: np.array, calibration):
     """
     tuple (x, y)
@@ -264,6 +300,9 @@ def raw_get_3d_coordinates(coordinates_2d: tuple, depth_map: np.array, calibrati
     """
     x, y = coordinates_2d
     ddval = depth_map[y][x]
+    if ddval == 0:
+        x, y = find_closest_valid_coordinate(depth_map, x, y, window_size=100)
+        ddval = depth_map[y][x]
     return calibration.convert_2d_to_3d(
         (x, y), ddval, 1)
 
@@ -317,6 +356,159 @@ def pick_points(pcd):
     vis.destroy_window()
     print("")
     return vis.get_picked_points()
+
+
+def get_baseline_frame(videofilepath, baseline_index):
+    playback = PyK4APlayback(videofilepath)
+    img = None
+    pcd = None
+    calibration = None
+    transformed_depth = None
+    index = 0
+    try:
+        playback.open()
+        while True:
+            try:
+                capture = playback.get_next_capture()
+
+                if capture.color is not None and capture.depth is not None:
+
+                    if index == baseline_index:
+
+                        capture._color = cv2.cvtColor(cv2.imdecode(
+                            capture.color, cv2.IMREAD_COLOR), cv2.COLOR_BGR2BGRA)
+                        capture._color_format = ImageFormat.COLOR_BGRA32
+
+                        img = capture.color
+                        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                        points = capture.transformed_depth_point_cloud.reshape(
+                            (-1, 3)).astype('float64')
+                        colors = capture.color[..., (2, 1, 0)].reshape(
+                            (-1, 3))
+
+                        pcd = o3d.geometry.PointCloud()
+                        pcd.points = o3d.utility.Vector3dVector(
+                            points)
+                        pcd.colors = o3d.utility.Vector3dVector(
+                            (colors/255).astype('float64'))
+                        calibration = capture._calibration
+                        transformed_depth = capture.transformed_depth
+                        break
+                    index += 1
+
+            except EOFError:
+                break
+    finally:
+        playback.close()
+    return img, pcd, calibration, transformed_depth
+
+
+def subsample_pcd_with_bounding_box(pcd, coordinates, calibration, transformed_depth):
+
+    x_tl, y_tl, color = coordinates[0]
+    x_br, y_br, _ = coordinates[1]
+    x_delta = x_br - x_tl
+    y_delta = y_br - y_tl
+    colors = np.asarray(pcd.colors)
+    points = np.asarray(pcd.points)
+    subsample_colors, subsample_points = subsample_pcd(
+        colors, points, ((x_tl, y_tl), x_delta, y_delta), calibration, transformed_depth, offset_y=0, offset_x=0, z_percentile=0.05)
+
+    subsampled = o3d.geometry.PointCloud()
+    subsampled.points = o3d.utility.Vector3dVector(subsample_points)
+    subsampled.colors = o3d.utility.Vector3dVector(subsample_colors)
+
+    return subsampled
+
+
+def label_sequence(new_mesh, video_path, coordinates, transform_window_size=5, threshold=0.75):
+    playback = PyK4APlayback(video_path)
+
+    img = None
+    pcd = None
+    calibration = None
+    transformed_depth = None
+    pcd_spine = new_mesh.sample_points_uniformly(
+        number_of_points=30000)
+    pcd_spine = new_mesh.sample_points_poisson_disk(
+        number_of_points=6000, pcl=pcd_spine)
+    transforms = []
+    frame_number = 0
+    saved_points = []
+    geometry = o3d.geometry.PointCloud()
+    vis = o3d.visualization.Visualizer()
+    vis.create_window()
+    vis.add_geometry(geometry)
+    vis.add_geometry(new_mesh)
+
+    try:
+        playback.open()
+        while True:
+            try:
+                capture = playback.get_next_capture()
+
+                if capture.color is not None and capture.depth is not None:
+
+                    capture._color = cv2.cvtColor(cv2.imdecode(
+                        capture.color, cv2.IMREAD_COLOR), cv2.COLOR_BGR2BGRA)
+                    capture._color_format = ImageFormat.COLOR_BGRA32
+
+                    img = capture.color
+                    img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                    points = capture.transformed_depth_point_cloud.reshape(
+                        (-1, 3)).astype('float64')
+                    colors = capture.color[..., (2, 1, 0)].reshape(
+                        (-1, 3))
+
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(
+                        points)
+                    pcd.colors = o3d.utility.Vector3dVector(
+                        (colors/255).astype('float64'))
+                    calibration = capture._calibration
+                    transformed_depth = capture.transformed_depth
+                    try:
+                        subsampled_cloud = subsample_pcd_with_bounding_box(
+                            pcd, coordinates, calibration, transformed_depth)
+                    except TypeError:
+                        subsampled_cloud = pcd
+                    rough_transform = np.eye(4)
+
+                    icp_transform = source_icp_transform(
+                        pcd_spine, subsampled_cloud, rough_transform, threshold=threshold, plane=False)
+                    avg_transform, transforms = get_average_transform(
+                        icp_transform, transforms, window_size=transform_window_size)
+                    avg_transform = rough_transform
+                    inv_transform = np.linalg.inv(avg_transform)
+
+                    new_mesh.transform(avg_transform)
+                    pcd_spine.transform(avg_transform)
+                    matching_cloud, matching_indices = find_points_within_radius(
+                        subsampled_cloud, pcd_spine, radius=8)
+                    geometry.points = subsampled_cloud.points
+                    colors = np.asarray(subsampled_cloud.colors)
+                    colors[matching_indices] = np.array([1, 1, 0])
+                    geometry.colors = o3d.utility.Vector3dVector(colors)
+
+                    vis.update_geometry(geometry)
+                    vis.update_geometry(new_mesh)
+
+                    vis.poll_events()
+                    vis.update_renderer()
+
+                    saved_points.append(
+                        [np.asarray(matching_cloud.points), np.asarray(matching_cloud.colors)])
+
+                    new_mesh.transform(inv_transform)
+                    pcd_spine.transform(inv_transform)
+
+                frame_number += 1
+
+            except EOFError:
+                break
+    finally:
+        playback.close()
+    return saved_points
 
 
 def play_single_initial_frame_mark_both(spine_mesh, playback, offset, baseline_frame, scale_scene=1.0):
@@ -430,6 +622,33 @@ def get_scene_geometry_from_capture(capture):
 
 
 def subsample_mesh(colors, points, bbox_params, calibration, depth_map, offset_y=0, offset_x=0, z_percentile=0.05):
+
+    quantile = np.quantile(points[:, 2], z_percentile)
+    mask_z = points[:, 2] > quantile
+
+    min_x = bbox_params[0][0] - offset_x
+    min_y = bbox_params[0][1] - offset_y
+    max_x = min_x + bbox_params[1] + 2*offset_x
+    max_y = min_y + bbox_params[2] + 2*offset_y
+
+    point_coords = [(min_x, min_y),
+                    (max_x, max_y)]
+    coords_3d = [raw_get_3d_coordinates(x, depth_map, calibration)
+                 for x in point_coords]
+    min_x_3d, min_y_3d, _ = coords_3d[0]
+    max_x_3d, max_y_3d, _ = coords_3d[1]
+    mask_x = (points[:, 0] > min_x_3d
+              ) & (points[:, 0] < max_x_3d)
+
+    mask_y = (points[:, 1] > min_y_3d
+              ) & (points[:, 1] < max_y_3d)
+
+    combined_mask = mask_x & mask_y & mask_z
+
+    return colors[combined_mask], points[combined_mask]
+
+
+def subsample_pcd(colors, points, bbox_params, calibration, depth_map, offset_y=0, offset_x=0, z_percentile=0.05):
 
     quantile = np.quantile(points[:, 2], z_percentile)
     mask_z = points[:, 2] > quantile
