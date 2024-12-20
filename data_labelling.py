@@ -13,12 +13,17 @@ from utils import get_closest_indices, find_points_within_radius, partition, sam
 from surg_shape_simulator import flip_normals, flip_normals_z
 from manual_param_visualizer import InteractiveMeshVisualizer
 from scipy.spatial import cKDTree
+import pickle as pkl
 import copy
 import cv2
-from markup_sequence import get_baseline_frame, write_bounding_boxes, subsample_pcd
+from markup_sequence import get_baseline_frame, subsample_pcd_with_bounding_box, label_sequence
 from pyk4a import PyK4APlayback
 import trimesh
 import json
+
+OUTPUT_MESH_FOLDER = "/home/connorscomputer/Documents/CT_DATA/CT_NIFTIS/NIFTI_SOLIDS_TRANSFORMED/"
+CONFIG_FOLDER = "/home/connorscomputer/Documents/CT_DATA/CONFIGS_BASIN/"
+RESULTS = "/home/connorscomputer/Documents/CT_DATA/RESULTS/"
 
 
 def color_clusters(mesh, clusters, cluster_n_triangles):
@@ -71,7 +76,8 @@ def get_spine_obj(spine_mesh, partition_map, spine_spline_indices, scene_points,
 
     return Spine(root_node, np.asarray(
         pcd_spine.points), cleaned_spine_points, scene_points, sampled_cloud, upvector, config, normal_cloud=sampled_cloud), Spine(new_root_node, np.asarray(
-            spine_mesh.vertices), cleaned_spine_points, scene_points, sampled_cloud, upvector, config, normal_cloud=sampled_cloud)
+            spine_mesh.vertices), cleaned_spine_points, scene_points, sampled_cloud, upvector, config, normal_cloud=sampled_cloud), Spine(new_root_node, np.asarray(
+                spine_mesh.vertices), cleaned_spine_points, scene_points, sampled_cloud, upvector, config, normal_cloud=sampled_cloud)
 
 
 def subsample_mesh(mesh, clusters, points):
@@ -243,24 +249,6 @@ def visualize_with_joints(mesh, arrows, spheres):
     vis.draw(geoms)
 
 
-def subsample_pcd_with_bounding_box(pcd, coordinates, calibration, transformed_depth):
-
-    x_tl, y_tl, color = coordinates[0]
-    x_br, y_br, _ = coordinates[1]
-    x_delta = x_br - x_tl
-    y_delta = y_br - y_tl
-    colors = np.asarray(pcd.colors)
-    points = np.asarray(pcd.points)
-    subsample_colors, subsample_points = subsample_pcd(
-        colors, points, ((x_tl, y_tl), x_delta, y_delta), calibration, transformed_depth, offset_y=20, offset_x=0, z_percentile=0.05)
-
-    subsampled = o3d.geometry.PointCloud()
-    subsampled.points = o3d.utility.Vector3dVector(subsample_points)
-    subsampled.colors = o3d.utility.Vector3dVector(subsample_colors)
-
-    return subsampled
-
-
 def disconnect_clusters(mesh):
     triangles = np.asarray(mesh.triangles)
     colors = np.asarray(mesh.vertex_colors)
@@ -297,16 +285,21 @@ def fill_holes_mesh(unprocessed_mesh: trimesh.Trimesh):
     return o3d_mesh
 
 
-def main(videopath, mesh_path, repick):
+def main(videopath, mesh_path, repick, baseline_frame=0):
 
     file_short = videopath.split('/')[-1].split('.')[0]
 
     mesh = o3d.io.read_triangle_mesh(mesh_path)
+
     unprocessed_mesh = trimesh.load(mesh_path, force='mesh')
     unprocessed_mesh = fill_holes_mesh(unprocessed_mesh)
 
-    img, pcd, calibration, transformed_depth = get_baseline_frame(videopath)
+    img, pcd, calibration, transformed_depth = get_baseline_frame(
+        videopath, baseline_frame)
     coordinates, baseline_frame = mark_relevant_frames([img], 0)
+    # rmove this!
+    # coordinates[0] = (270, 149, (1, 1, 1))
+    # coordinates[1] = (719, 423, (1, 1, 1))
 
     x_tl, y_tl, color = coordinates[0]
     x_br, y_br, _ = coordinates[1]
@@ -319,6 +312,10 @@ def main(videopath, mesh_path, repick):
         pcd, coordinates, calibration, transformed_depth)
     # subsample baseline frame to get initial mesh
     disconnect_clusters(mesh)
+
+    o3d.io.write_triangle_mesh(OUTPUT_MESH_FOLDER +
+                               f"mesh_untransformed_undeformed_{file_short}.ply", mesh)
+    transformed_mesh_undeformed = copy.deepcopy(mesh)
     partition_map = partition(mesh)
     rgb_num_map = {key: ind for ind, key in enumerate(partition_map)}
     # replace keys in partition maps with
@@ -326,6 +323,7 @@ def main(videopath, mesh_path, repick):
         partition_map[value] = partition_map.pop(key)
 
     # use this picking to define which processes we're choosing
+    # first pick processes from bottom to top, then correspondences
     picked_process_points, picked_vertices, picked_mesh_correspondence_vertices, picked_cloud_points = pick_all_points(
         mesh, pcd, partition_map, file_short, repick)
 
@@ -340,6 +338,7 @@ def main(videopath, mesh_path, repick):
 
     icp_transform = source_icp_transform(
         pcd_spine, pcd, rough_transform, threshold=threshold, plane=False)
+    reverse_icp_transform = np.linalg.inv(icp_transform)
     mesh.transform(icp_transform)
     unprocessed_mesh.transform(icp_transform)
     o3d.visualization.draw_geometries([mesh, pcd])
@@ -364,7 +363,10 @@ def main(videopath, mesh_path, repick):
     matching_cloud = filter_points_in_bbox(pcd, bbox2)
 
     matching_cloud.estimate_normals()
-    matching_cloud.orient_normals_consistent_tangent_plane(25)
+    try:
+        matching_cloud.orient_normals_consistent_tangent_plane(25)
+    except RuntimeError:
+        print("Couldn't orient normals")
     normals = np.asarray(matching_cloud.normals)
     flipped_normals = flip_normals(np.asarray(matching_cloud.points), normals)
     flipped_normals = flip_normals_z(flipped_normals)
@@ -394,10 +396,10 @@ def main(videopath, mesh_path, repick):
 
     spine_points = np.asarray(mesh.vertices)[picked_process_points]
 
-    with open(f"deformation_configs/deform_config_{file_short}.json", 'r') as f:
+    with open(f"{CONFIG_FOLDER}deform_config_{file_short}.json", 'r') as f:
         config = json.load(f)
 
-    spine_obj, spine_obj_to_deform = get_spine_obj(mesh, partition_map, picked_process_points, np.asarray(
+    spine_obj, spine_obj_to_deform, spine_obj_to_deform_untransformed = get_spine_obj(mesh, partition_map, picked_process_points, np.asarray(
         matching_cloud.points), matching_cloud, spine_points, pcd_spine, new_partition_map, config,  splits=1)
 
     # spheres, arrow = get_joints_with_axes(spine_obj)
@@ -406,22 +408,45 @@ def main(videopath, mesh_path, repick):
     fparams = config['initial_fparam']
 
     # fparams, _ = spine_obj.run_optimization()
-    # fparams = [26, -21, -12, -13, 2, -26, 0, 5, 7]
 
-    # fparams = [0, 0, 0, 0, 0, -26, 0, 0, 7]
     new_mesh = copy.deepcopy(mesh)
-    viz = InteractiveMeshVisualizer()
-    viz.set_mesh_and_spine_obj(
-        new_mesh, spine_obj_to_deform, fparams, pcd)
-    viz.run()
-    print("")
+    # viz = InteractiveMeshVisualizer()
+    # viz.set_mesh_and_spine_obj(
+    #     new_mesh, spine_obj_to_deform, fparams, pcd)
+    # viz.run()
+    # print("")
+
+    spine_obj_to_deform_untransformed.apply_global_transform_world_coordinates(
+        reverse_icp_transform)
 
     joint_params = fparams[:-6]
     global_params = fparams[-6:]
     joint_params, global_params = spine_obj.convert_degree_params_to_radians(
         joint_params, global_params)
+
+    spine_obj_to_deform_untransformed.apply_joint_parameters(joint_params)
+    spine_obj_to_deform_untransformed.apply_joint_angles()
+
+    new_mesh_untransformed = copy.deepcopy(mesh)
+    new_mesh_untransformed.vertices = o3d.utility.Vector3dVector(
+        spine_obj_to_deform_untransformed.vertices)
+    spine_obj_to_deform.reset_spine()
     spine_obj_to_deform.apply_global_parameters(global_params)
     spine_obj_to_deform.apply_global_transform()
+
+    new_mesh_undeformed = copy.deepcopy(mesh)
+    new_mesh_undeformed.vertices = o3d.utility.Vector3dVector(
+        spine_obj_to_deform.vertices)
+
+    o3d.io.write_triangle_mesh(OUTPUT_MESH_FOLDER +
+                               f"mesh_transformed_undeformed{file_short}.ply", new_mesh_undeformed)
+
+    all_joints = spine_obj_to_deform.get_all_joints()
+    axes = np.array([[*joint.get_axes(), joint.position]
+                    for joint in all_joints])
+
+    save_axes_params(axes, fparams, file_short)
+
     spine_obj_to_deform.apply_joint_parameters(joint_params)
     spine_obj_to_deform.apply_joint_angles()
 
@@ -430,15 +455,46 @@ def main(videopath, mesh_path, repick):
     new_mesh.vertices = o3d.utility.Vector3dVector(
         spine_obj_to_deform.vertices)
 
-    # visualize_with_joints(new_mesh, arrow, spheres)
+    source, target = o3d.geometry.PointCloud(), o3d.geometry.PointCloud()
+    source.points, target.points = o3d.utility.Vector3dVector(np.asarray(new_mesh_untransformed.vertices)[
+        :100]), o3d.utility.Vector3dVector(np.asarray(new_mesh.vertices)[:100])
+
+    o3d.io.write_triangle_mesh(OUTPUT_MESH_FOLDER +
+                               f"mesh_transformed_{file_short}.ply", new_mesh)
+
+    # rigid_transform = rough_register_via_correspondences(source, target)
+
+    # we want to save mesh, fparams, joint coordinates and joint axes vectors
 
     o3d.visualization.draw_geometries([new_mesh, pcd])
+
+    recorded_points = label_sequence(
+        new_mesh, videopath, coordinates, transform_window_size=30, threshold=0.7)
+    recorded_points_array = [np.array((x[0], x[1])) for x in recorded_points]
+
+    file_points = f"{RESULTS}closest_points_{file_short}.pkl"
+    with open(file_points, 'wb+') as f:
+        # source, destination
+        pkl.dump(recorded_points_array, f)
+
+
+def save_axes_params(axes, fparams, file_short):
+
+    file_fparams = f"{RESULTS}fparams_{file_short}.npy"
+    file_axes = f"{RESULTS}axes_{file_short}.npy"
+    with open(file_fparams, 'wb+') as f:
+        # source, destination
+        np.save(f, fparams)
+
+    with open(file_axes, 'wb+') as f:
+        # source, destination
+        np.save(f, axes)
 
 
 if __name__ == "__main__":
 
-    videopath = "/home/connorscomputer/Documents/CT_DATA/VIDEOS/HReJ6KFM_20240916_090806.mkv"
-    meshpath = "/home/connorscomputer/Documents/CT_DATA/CT_NIFTIS/NIFTI_SOLIDS/mesh_HReJ6KFM_20240916_090806.ply"
+    videopath = "/home/connorscomputer/Documents/CT_DATA/VIDEOS/MXdLc6ez_20240911_091846.mkv"
+    meshpath = "/home/connorscomputer/Documents/CT_DATA/CT_NIFTIS/NIFTI_SOLIDS/mesh_MXdLc6ez_20240911_091846.ply"
     # parser = ArgumentParser(description="Data labelling file")
     # parser.add_argument(
     #     "FILE1", type=str, help="Path to mkv file")
@@ -448,4 +504,8 @@ if __name__ == "__main__":
     # videopath: str = args.FILE1
     # meshpath = args.FILE2
 
-    main(videopath, meshpath, False)
+    main(videopath, meshpath, False, baseline_frame=0)
+
+[3.16789025e+00,  3.50000000e+00, -3.07109098e-03,  2.57858830e+00,
+ 3.22681595e+00, -1.41716013e+00, -1.26055501e+01, -2.10188174e+00,
+ 6.04643178e+00, 1.00000000e+00,  3.73652842e+00,  2.48284774e+00]

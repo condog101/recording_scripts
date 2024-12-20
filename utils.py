@@ -322,7 +322,10 @@ def find_closest_orthogonal(basis_vector, target_vector):
     orthogonal = target_vector - projection
 
     # Normalize result
-    return orthogonal / np.linalg.norm(orthogonal)
+    res = (orthogonal / np.linalg.norm(orthogonal))
+    if np.sign(np.dot(res, target_vector)) == -1:
+        return res * -1
+    return res
 
 
 def align_vectors_to_axes(vec_for_x, vec_for_y, vec_for_z):
@@ -377,17 +380,21 @@ def get_new_mapping(vertex_mapping, original_vertices, new_vertices):
     return new_dict
 
 
-def get_average_transform(transform, sliding_window, window_size=5):
-    rotation = transform[:3, :3]
-    translation = transform[:3, 3]
-    r = Rotation.from_matrix(np.array(rotation))
-    quaternion = r.as_quat(scalar_first=True)
+def get_average_transform(transform, sliding_window, window_size=10):
 
-    if len(sliding_window) == 0:
+    if len(sliding_window) < window_size:
+        transform = np.eye(4)
+        rotation = transform[:3, :3]
+        translation = transform[:3, 3]
+        r = Rotation.from_matrix(np.array(rotation))
+        quaternion = r.as_quat(scalar_first=True)
         sliding_window.append((translation, quaternion))
         return transform, sliding_window
     else:
-
+        rotation = transform[:3, :3]
+        translation = transform[:3, 3]
+        r = Rotation.from_matrix(np.array(rotation))
+        quaternion = r.as_quat(scalar_first=True)
         if len(sliding_window) == window_size:
             sliding_window.pop(0)
         translations = [x[0] for x in sliding_window]
@@ -407,3 +414,60 @@ def get_average_transform(transform, sliding_window, window_size=5):
         ema_matrices[:3, :3] = rotation_matrix_back
         ema_matrices[:3, 3] = avg_translation
         return ema_matrices, sliding_window
+
+
+def sample_points_inside_mesh(mesh, n_points, seed, bbox):
+
+    np.random.seed(seed)
+    # First get the mesh's bounding box
+
+    min_bound = bbox.min_bound
+    max_bound = bbox.max_bound
+
+    # Sample points uniformly in the bounding box
+
+    scene = o3d.t.geometry.RaycastingScene()
+
+    inside_points = np.zeros(shape=(0, 3))
+
+    _ = scene.add_triangles(mesh)  # we do not need the geometry ID for mesh
+
+    while len(inside_points) < n_points:
+        points = np.random.uniform(min_bound, max_bound, size=(
+            n_points * 4, 3)).astype(np.float32)
+
+    # If we got fewer points than requested, recursively sample more
+
+        occupancy = scene.compute_occupancy(points).numpy().astype(bool)
+        new_points = points[occupancy]
+        inside_points = np.unique(
+            np.vstack((inside_points, new_points)), axis=0)
+        seed += 1
+
+    return inside_points[:n_points]
+
+
+def filter_points_in_bbox(pcd, bbox):
+    """
+    pcd: open3d.geometry.PointCloud
+    bbox: open3d.geometry.AxisAlignedBoundingBox or open3d.geometry.OrientedBoundingBox
+    """
+    # Get points that are inside the bounding box
+    points = np.asarray(pcd.points)
+    indices = bbox.get_point_indices_within_bounding_box(pcd.points)
+
+    # Create new point cloud with only the points inside bbox
+    filtered_pcd = o3d.geometry.PointCloud()
+    filtered_pcd.points = o3d.utility.Vector3dVector(points[indices])
+
+    # Copy colors if they exist
+    if pcd.has_colors():
+        filtered_pcd.colors = o3d.utility.Vector3dVector(
+            np.asarray(pcd.colors)[indices])
+
+    # Copy normals if they exist
+    if pcd.has_normals():
+        filtered_pcd.normals = o3d.utility.Vector3dVector(
+            np.asarray(pcd.normals)[indices])
+
+    return filtered_pcd

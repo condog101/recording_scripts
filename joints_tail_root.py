@@ -70,7 +70,7 @@ class BallJoint:
         T[0:3, 0:3] = R_constrained
         return T
 
-    def to_rotation_only_matrix(self, rotation_constraint=None):
+    def to_rotation_only_matrix(self):
 
         constrained_matrix = self.constrain_rotation_matrix(
             self.axis_rotation)
@@ -89,7 +89,7 @@ class BallJoint:
 
 
 class Bones:
-    def get_sandwich_transform(self, joint: BallJoint, rotation_constraint=None):
+    def get_sandwich_transform(self, joint: BallJoint):
         # first bring the joint to origin, then align joint axes with world
         head_joint_translation = np.array(joint.position) * -1.0
         t1 = vector_to_translation_matrix(head_joint_translation)
@@ -140,7 +140,10 @@ class Vertebrae(Bones):
         principal_vectors = pca.components_
         x_vector = self.closest_aligning(
             self.forward_vector, principal_vectors)
-        z_vector = self.closest_aligning(self.upvector, principal_vectors)
+        reduced_principal_vectors = np.array([
+            x for x in principal_vectors if not np.array_equal(x, x_vector) and not np.array_equal(x * -1, x_vector)])
+        z_vector = self.closest_aligning(
+            self.upvector, reduced_principal_vectors)
         y = np.cross(z_vector, x_vector)
 
         # Normalize y
@@ -240,13 +243,6 @@ class Vertebrae(Bones):
 
         return self.vertex_ids + head_ids
 
-    @staticmethod
-    def update_single_point_position(joint, transform):
-        points = joint.position.reshape(1, -1)
-        homogeneous = np.hstack([points, np.ones((len(points), 1))]).T
-        transformed = (transform @ homogeneous).T[:, :3][0]
-        joint.position = transformed
-
     def update_joint_positions(self, transform):
         # this should update the position of my joints, and any children I have
 
@@ -272,20 +268,56 @@ class Vertebrae(Bones):
             self.head_joint.axis_rotation = np.array([0, 0, 0])
             self.head_child.propagate_joint_updates(spine)
 
+    def find_vertebrae_point(self, index, link_count):
+        if index in self.vertex_ids:
+            return link_count
+        if self.head_child is not None:
+            return self.head_child.find_vertebrae_point(index, link_count + 1)
+        else:
+            raise ValueError("Couldn't find index in any vertebrae")
+
+    def get_head_joint_by_link(self, link_index):
+        if link_index == 0:
+            if self.head_joint is None:
+                raise ValueError("This vertebrae has no head joint")
+            else:
+                return self.head_joint
+        else:
+            if self.head_child is None:
+                raise ValueError(
+                    "This vertebrae has no children, cannot proceed to find head joint")
+            else:
+                return self.head_child.get_head_joint_by_link(link_index - 1)
+
 
 class Spine(Bones):
 
+    def extract_bounds(self, config):
+        raw_bounds = config["bounds"]
+        adjusted_bounds = [(self.init_fparams[ind] + x, self.init_fparams[ind] + y)
+                           for ind, (x, y) in enumerate(raw_bounds)]
+        self.bounds = adjusted_bounds
+        # self.integer_bounds = [Integer(x, y) for x, y in self.bounds]
+
+    def find_vertebrae_point(self, index):
+
+        return self.root_vertebrae.find_vertebrae_point(index, 0)
+
+    def get_link_joint(self, link):
+        return self.root_vertebrae.get_head_joint_by_link(link)
+
     def __init__(self, root_vertebrae, vertices_array, video_curve_points, scene_points,
-                 sampled_cloud, upvector,
-                 translation_bound=5, alpha=0.5, beta=0.5, threshold=0.4, normal_cloud=None, tip_threshold=0.1):
-        self.alpha = alpha
-        self.beta = beta
-        self.threshold = threshold
+                 sampled_cloud, upvector, config, normal_cloud=None):
+        self.alpha = config["alphabeta"][0]
+        self.beta = config["alphabeta"][1]
+        self.init_fparams = config["initial_fparam"]
+        self.threshold = config["registration_threshold"][0]
         self.root_vertebrae = root_vertebrae
         self.translation_offset = np.eye(4)
         self.initial_vertices = vertices_array.copy()
         self.vertices = vertices_array.copy()
         self.upvector = upvector
+        self.fparams = np.copy(self.init_fparams)
 
         self.initial_fitness = None
         self.video_curve_points = video_curve_points
@@ -294,40 +326,27 @@ class Spine(Bones):
 
         self.all_joints = self.get_all_joints()
 
-        self.rotation_bounds = [Integer(-50, 50)
-                                for _ in range(0, (len(self.all_joints)) * 3)]
-
-        for i in range(0, 3):
-
-            self.rotation_bounds.append(Integer(-40, 40))
-
-        # self.translation_bounds = [
-        #     (-translation_bound, translation_bound) for _ in range(0, 3)]
-
-        self.translation_bounds = [
-            Integer(-3, 3) for _ in range(0, 3)]
-
-        self.translation_bounds[-1] = Integer(-1, 1)
-        # self.translation_bounds[-1] = (2, 3)
+        self.extract_bounds(config)
         # self.translation_bounds[0] = (-1.3, -1.2)
 
         self.id_transform = np.eye(4)
         self.get_centroid_joint_position_and_axis()
 
         self.process_indices = self.get_vertebrae_tip_indices(
-            tip_threshold=tip_threshold)
+            tip_threshold=config["tip_threshold"][0])
         self.sampled_cloud = sampled_cloud
         temp_cloud = o3d.geometry.PointCloud()
         temp_cloud.points = o3d.utility.Vector3dVector(
             vertices_array[self.process_indices])
         self.process_cloud, _ = find_points_within_radius(
             self.sampled_cloud, temp_cloud, radius=4)
-
+        self.process_cloud = self.sampled_cloud
         self.process_pcd = o3d.geometry.PointCloud()
         self.process_pcd.points = o3d.utility.Vector3dVector(
             self.vertices[self.process_indices])
         self.normal_cloud = normal_cloud
-        self.normal_query_surface = o3DSurface(self.process_cloud)
+        self.normal_query_surface = o3DSurface(self.sampled_cloud)
+        self.iterations = config["iterations"][0]
 
     def update_vertex_positions(self, transform, indices):
         if indices is not None:
@@ -344,25 +363,9 @@ class Spine(Bones):
     def get_centroid_joint_position_and_axis(self):
         centroid_position = np.mean(self.initial_vertices, axis=0)
 
-        pca = PCA()
-        pca.fit(self.initial_vertices)
-        principal_vectors = pca.components_
+        root_joint = self.root_vertebrae.get_joints_and_child_joints()[0]
 
-        root_vertebra_centroid = np.mean(
-            self.initial_vertices[self.root_vertebrae.vertex_ids], axis=0)
-
-        to_centroid_vector = centroid_position - root_vertebra_centroid
-        to_centroid_vector = to_centroid_vector / \
-            np.linalg.norm(to_centroid_vector)
-
-        x_vector = self.root_vertebrae.closest_aligning(
-            to_centroid_vector, principal_vectors)
-
-        self.global_pca_x_vector = x_vector
-
-        z_vector = self.root_vertebrae.closest_aligning(
-            self.upvector, principal_vectors)
-        y_vector = np.cross(x_vector, z_vector)
+        x_vector, y_vector, z_vector = root_joint.get_axes()
         self.centroid = BallJoint(
             centroid_position, centroid_position + x_vector, x_vector, y_vector, z_vector)
 
@@ -399,13 +402,12 @@ class Spine(Bones):
         if self.initial_fitness is None:
             self.initial_fitness = result.fitness
 
-        return -len(np.asarray(result.correspondence_set))
-        diff = self.initial_fitness - result.fitness
-        return (result.inlier_rmse/threshold) + np.exp(diff)
+        # return -len(np.asarray(result.correspondence_set))
+        # diff = self.initial_fitness - result.fitness
+        # return (result.inlier_rmse/threshold) + np.exp(diff)
 
         raw_error = 1 - result.fitness
         return raw_error
-        return 1 - np.exp(-10 * raw_error)
 
     def get_surface_error(self):
         if self.normal_cloud is None:
@@ -414,14 +416,14 @@ class Spine(Bones):
         else:
             bounds = self.normal_query_surface.check_point_position(
                 self.vertices[self.process_indices])
-            raw_error = len(bounds[bounds == 1])  # /len(self.vertices)
+            raw_error = len(bounds[bounds == 1])/len(bounds)
 
         return raw_error
-        # return 1 - np.exp(-10 * raw_error)
 
     def reset_spine(self):
         self.vertices[:, :] = self.initial_vertices[:, :]
         self.root_vertebrae.reset_joints()
+        self.centroid.reset_joint_position()
 
     def get_all_joints(self):
         return self.root_vertebrae.get_joints_and_child_joints()
@@ -434,11 +436,18 @@ class Spine(Bones):
     def apply_joint_angles(self):
         self.root_vertebrae.propagate_joint_updates(self)
 
+    def apply_global_transform_world_coordinates(self, transform):
+        self.update_vertex_positions(transform, None)
+        all_joints = self.get_all_joints()
+        for joint in all_joints:
+            joint.update_position(transform)
+
     def apply_global_transform(self):
         combined_transform = self.get_sandwich_transform(
-            self.centroid, rotation_constraint=None)
-        # rotation_constraint was (3.0, 3.0, 3.0)
+            self.centroid)
+
         combined_rotation_translation = self.translation_offset @ combined_transform
+        self.centroid.update_position(combined_rotation_translation)
         self.update_vertex_positions(combined_rotation_translation, None)
         all_joints = self.get_all_joints()
         for joint in all_joints:
@@ -454,11 +463,11 @@ class Spine(Bones):
         self.translation_offset = transform
 
     def convert_degree_params_to_radians(self, joint_parameters, global_parameters):
-        new_joint_parameters = np.array(joint_parameters)/4
+        new_joint_parameters = np.array(joint_parameters)
         new_joint_parameters = np.deg2rad(new_joint_parameters)
         new_global_parameters = np.array(global_parameters)
-        new_global_parameters[:3] = new_global_parameters[:3]/4
-        new_joint_parameters[:3] = np.deg2rad(new_joint_parameters[:3])
+        new_global_parameters[:3] = new_global_parameters[:3]
+        new_global_parameters[:3] = np.deg2rad(new_global_parameters[:3])
 
         return list(new_joint_parameters), list(new_global_parameters)
 
@@ -484,24 +493,29 @@ class Spine(Bones):
 
         return self.get_alignment_error(params[:-6], params[-6:])
 
-    def run_optimization(self, max_iterations=150):
-        initial_params = np.zeros(((len(self.all_joints)+1)*3)+3)
+    def run_optimization(self):
 
-        initial_params = np.zeros(((len(self.all_joints)+1)*3)+3)
-        bounds = self.rotation_bounds + self.translation_bounds
+        initial_params = np.array(self.init_fparams)
+        # bounds = self.integer_bounds
+        minimizer_kwargs = {"method": "L-BFGS-B", "bounds": self.bounds}
 
-        # Normalize final quaternion
-        result = gp_minimize(self.objective,                  # the function to minimize
-                             # the bounds on each dimension of x
-                             bounds,
-                             #  acq_func="EI",      # the acquisition function
-                             n_calls=max_iterations,
-                             # the number of evaluations of f
-                             x0=list(initial_params),
-                             n_random_starts=10,  # the number of random initialization points
-                             noise=1e-10,
-                             n_jobs=-1,
-                             random_state=1234)
+        result = basinhopping(self.objective, initial_params,
+                              minimizer_kwargs=minimizer_kwargs,
+                              niter=self.iterations,  # Number of basin hopping iterations
+                              T=0.5,      # Temperature parameter for acceptance
+                              stepsize=0.5)
+
+        # result = gp_minimize(self.objective,                  # the function to minimize
+        #                      # the bounds on each dimension of x
+        #                      bounds,
+        #                      #  acq_func="EI",      # the acquisition function
+        #                      n_calls=max_iterations,
+        #                      # the number of evaluations of f
+        #                      x0=list(initial_params),
+        #                      n_random_starts=10,  # the number of random initialization points
+        #                      noise=1e-10,
+        #                      n_jobs=-1,
+        #                      random_state=1234)
 
         final_params = result.x
         print("Ran bayesian optimization")
@@ -537,13 +551,12 @@ def create_armature_objects(links, partition_map, spline_points, upvector, verti
 
     lowest_spline_point = spline_points[0]
     p1, p2 = np.linalg.norm(
-        links[0][1] - lowest_spline_point), np.linalg.norm(links[-1][0] - lowest_spline_point)
+        links[0][0] - lowest_spline_point), np.linalg.norm(links[-1][1] - lowest_spline_point)
 
     if p1 > p2:
         links = list(reversed(links))
         links = [(x[1], x[0], x[2]) for x in links]
 
-    centroid = np.mean(vertices, axis=0)
-    forward_vector = (centroid - links[0][1])
+    forward_vector = (links[-1][1] - links[0][0])
 
     return traverse_children(links, partition_map, upvector, forward_vector, vertices)

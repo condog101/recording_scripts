@@ -68,46 +68,46 @@ class InteractiveMeshVisualizer:
         return int(self.last_clicked_node - 1) * 3
 
     def decrement_x_rotation(self, vis):
-        self.transform_adjust(self.get_fparam_trio_index(), -0.5)
+        self.transform_adjust(self.get_fparam_trio_index(), -0.25)
 
     def increment_x_rotation(self, vis):
-        self.transform_adjust(self.get_fparam_trio_index(), 0.5)
+        self.transform_adjust(self.get_fparam_trio_index(), 0.25)
 
     def decrement_y_rotation(self, vis):
-        self.transform_adjust(self.get_fparam_trio_index() + 1, -0.5)
+        self.transform_adjust(self.get_fparam_trio_index() + 1, -0.25)
 
     def increment_y_rotation(self, vis):
-        self.transform_adjust(self.get_fparam_trio_index() + 1, 0.5)
+        self.transform_adjust(self.get_fparam_trio_index() + 1, 0.25)
 
     def decrement_z_rotation(self, vis):
-        self.transform_adjust(self.get_fparam_trio_index() + 2, -0.5)
+        self.transform_adjust(self.get_fparam_trio_index() + 2, -0.25)
 
     def increment_z_rotation(self, vis):
-        self.transform_adjust(self.get_fparam_trio_index() + 2, 0.5)
+        self.transform_adjust(self.get_fparam_trio_index() + 2, 0.25)
 
     def decrement_x_transform(self, vis):
         if self.check_link_can_transform():
-            self.transform_adjust(-3, -0.5)
+            self.transform_adjust(-3, -0.25)
 
     def increment_x_transform(self, vis):
         if self.check_link_can_transform():
-            self.transform_adjust(-3, 0.5)
+            self.transform_adjust(-3, 0.25)
 
     def decrement_y_transform(self, vis):
         if self.check_link_can_transform():
-            self.transform_adjust(-2, -0.5)
+            self.transform_adjust(-2, -0.25)
 
     def increment_y_transform(self, vis):
         if self.check_link_can_transform():
-            self.transform_adjust(-2, 0.5)
+            self.transform_adjust(-2, 0.25)
 
     def decrement_z_transform(self, vis):
         if self.check_link_can_transform():
-            self.transform_adjust(-1, -0.5)
+            self.transform_adjust(-1, -0.25)
 
     def increment_z_transform(self, vis):
         if self.check_link_can_transform():
-            self.transform_adjust(-1, 0.5)
+            self.transform_adjust(-1, 0.25)
 
     def set_mesh_and_spine_obj(self, mesh, spine_obj, fparams, pcd):
         """Load a mesh from file"""
@@ -131,7 +131,6 @@ class InteractiveMeshVisualizer:
         print(self.fparams)
         self.spine_obj.reset_spine()
         self.vis.destroy_window()
-        return False
 
     def run(self):
         """Main run loop"""
@@ -139,3 +138,7 @@ class InteractiveMeshVisualizer:
 
         # Run the event loop
         self.vis.run()
+
+
+[3.5,         12.47066159,  11.47931577, -15.45208772,  11.58824518,
+ 5.75, -10.81504712,  14.42096189,   9.25]

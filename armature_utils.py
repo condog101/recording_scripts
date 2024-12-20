@@ -6,6 +6,9 @@ from itertools import permutations
 
 def get_linkage_ordering(centroid_dict):
 
+    if len(centroid_dict) == 2:
+        return [0, 1]
+
     total_heap = []
     distance_matrix = np.zeros(shape=(len(centroid_dict), len(centroid_dict)))
     # for each centroid, get furthest centroids to them
@@ -108,25 +111,39 @@ def get_joint_positions(partition_map, mesh, splits=1, spine_points=None):
 
     link_order = get_linkage_ordering(centroid_dict)
     bone_coords = []
-    for ind, i in enumerate(np.array(link_order)):
-        if ind > 0 and ind < len(link_order)-1:
-            # going from lower vertebrae to current
-            prev_vec = (centroid_dict[i] -
-                        centroid_dict[link_order[ind-1]])*0.5
-            # going from current verterae to next
-            next_vec = (centroid_dict[link_order[ind+1]] -
-                        centroid_dict[i])*0.5
-            # tail of bone goes from center of previous coordinate to halfway out
-            tail = centroid_dict[link_order[ind-1]] + prev_vec
-            head = centroid_dict[i] + next_vec
-            bone_coords.append((tail, head, link_order[ind]))
+    if len(link_order) == 2:
+        prev_vec = (centroid_dict[link_order[1]] -
+                    centroid_dict[link_order[0]])*0.5
+        tail = centroid_dict[link_order[0]] + prev_vec
+        next_vec = (centroid_dict[link_order[1]] -
+                    centroid_dict[0])*0.5
+        head = centroid_dict[1] + next_vec
+        bone_coords = [(centroid_dict[link_order[0]],
+                        tail, link_order[0])]
+        head_r = bone_coords[-1][1]
+        bone_coords.append(
+            (head_r, centroid_dict[link_order[-1]], link_order[-1]))
+    else:
+        for ind, i in enumerate(np.array(link_order)):
+            if ind > 0 and ind < len(link_order)-1:
+                # going from lower vertebrae to current
+                prev_vec = (centroid_dict[i] -
+                            centroid_dict[link_order[ind-1]])*0.5
+                # going from current verterae to next
+                next_vec = (centroid_dict[link_order[ind+1]] -
+                            centroid_dict[i])*0.5
+                # tail of bone goes from center of previous coordinate to halfway out
+                tail = centroid_dict[link_order[ind-1]] + prev_vec
+                head = centroid_dict[i] + next_vec
+                bone_coords.append((tail, head, link_order[ind]))
 
-    l_tail = bone_coords[0][0]
-    r_head = bone_coords[-1][1]
-    # tail of first link is simply centroid of vertebrae 1, head of last link is centroid of last vertebrae
-    bone_coords.append((r_head, centroid_dict[link_order[-1]], link_order[-1]))
-    bone_coords = [(centroid_dict[link_order[0]],
-                    l_tail, link_order[0])] + bone_coords
+        l_tail = bone_coords[0][0]
+        r_head = bone_coords[-1][1]
+        # tail of first link is simply centroid of vertebrae 1, head of last link is centroid of last vertebrae
+        bone_coords.append(
+            (r_head, centroid_dict[link_order[-1]], link_order[-1]))
+        bone_coords = [(centroid_dict[link_order[0]],
+                        l_tail, link_order[0])] + bone_coords
 
     # each vertebrae has a bone
 
