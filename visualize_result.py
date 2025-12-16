@@ -9,6 +9,8 @@ obj_path = "/home/connorscomputer/Desktop/imfusion_world_ct_12.obj"
 mkv_path = "/home/connorscomputer/Desktop/9J4ophGG_20251209_162542.mkv"
 board_path = "/home/connorscomputer/Desktop/hex30_fusion_coordinates_flipped.stl"
 
+obj34_path = "/home/connorscomputer/Desktop/imfusion_world_ct_34.obj"
+
 # Options
 FLIP_POINTCLOUD_Y = False  # Set to True to negate Y coordinates of the point cloud
 
@@ -27,15 +29,20 @@ def main():
                             dtype=np.float32)
 
     # this one is for marker 1-2
-    world_to_cb_geom = np.array([[-2.41840158e-01,  2.16010175e-01,  9.45966671e-01,
-                                  -3.80291390e+01],
-                                 [-5.21356971e-01, -8.51150466e-01,  6.10720340e-02,
-                                  2.86327744e+01],
-                                 [8.18352154e-01, -4.78416648e-01,  3.18460773e-01,
-                                  3.77418145e+02],
+    world_to_cb_geom = np.array([[-2.08019312e-01,  1.77929946e-01,  9.61805022e-01,
+                                  -3.77133231e+01],
+                                 [-4.93524127e-01, -8.68063508e-01,  5.38486937e-02,
+                                  2.82613188e+01],
+                                 [8.44489136e-01, -4.63472416e-01,  2.68386695e-01,
+                                  3.76009548e+02],
                                  [0.00000000e+00,  0.00000000e+00,  0.00000000e+00,
                                   1.00000000e+00]])
+
+    world_to_cb_geom_34 = np.array([[-0.280285881337095,  0.417790855024142,  0.864228341459179,  -35.6694851860801],  [-0.381513601384156, -0.874638166921118,  0.299091037852621,
+                                                                                                                        10.2373877661016],  [0.880844592809639,   -0.2458838718238,  0.404541623192173,   379.616014131788],  [0,                  0,                  0,                  1]])
     T_ct_tool = np.linalg.inv(board_to_det) @ world_to_cb_geom
+
+    T_ct_tool_34 = np.linalg.inv(board_to_det) @ world_to_cb_geom_34
 
     T_camera_marker = np.load(marker_to_rgbd_path).astype(
         np.float64)  # Marker/Tool → Azure Kinect Camera
@@ -53,6 +60,9 @@ def main():
 
     ct_mesh = o3d.io.read_triangle_mesh(obj_path)
     ct_mesh.compute_vertex_normals()
+
+    ct_mesh_34 = o3d.io.read_triangle_mesh(obj34_path)
+    ct_mesh_34.compute_vertex_normals()
 
     board_mesh = o3d.io.read_triangle_mesh(board_path)
     board_mesh.compute_vertex_normals()
@@ -77,7 +87,10 @@ def main():
     # Apply same transformation to the CT coordinate frame
 
     combine = T_camera_marker @ T_ct_tool
+
+    combine_34 = T_camera_marker @ T_ct_tool_34
     ct_mesh.transform(combine)
+    ct_mesh_34.transform(combine_34)
     board_mesh.transform(T_camera_marker)
 
     # Transform the CT frame too
@@ -85,6 +98,7 @@ def main():
 
     # Color the CT mesh for visualization
     ct_mesh.paint_uniform_color([1.0, 0.0, 0.0])  # Red color
+    ct_mesh_34.paint_uniform_color([0.0, 1.0, 0.0])  # Green color
 
     # Compute distance between board_mesh and CT_mesh origins
     board_origin = np.array([0, 0, 0, 1])  # Origin in homogeneous coordinates
@@ -164,7 +178,7 @@ def main():
 
         # Add coordinate frames to the visualization
         o3d.visualization.draw_geometries(
-            [pcd, ct_mesh, camera_frame,
+            [pcd, ct_mesh, ct_mesh_34, camera_frame,
                 ct_origin_frame, board_mesh],
             window_name="CT in Azure Kinect Space",
             width=1280,
