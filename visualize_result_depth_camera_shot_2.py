@@ -172,15 +172,6 @@ def main():
     ct_78_depth_camera_marker = np.load(to_78_to_depth_camera_path).astype(
         np.float64)
 
-    ct_78_depth_camera_marker = np.array([[-4.25340229e-01,  8.45597362e-01,  3.22569100e-01,
-                                           -6.12556657e+01],
-                                          [7.76765499e-01,  5.23994394e-01, -3.49378400e-01,
-                                           -7.24692662e+01],
-                                          [-4.64457830e-01,  1.01955856e-01, -8.79706675e-01,
-                                           4.91554035e+02],
-                                          [0.00000000e+00,  0.00000000e+00,  0.00000000e+00,
-                                           1.00000000e+00]])
-
     ct_mesh = o3d.io.read_triangle_mesh(obj_path)
     ct_mesh.compute_vertex_normals()
 
